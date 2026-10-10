@@ -1,0 +1,37 @@
+# Processa áudio com ffmpeg para os comandos /converter, /cortar, /normalizar,
+# /juntar e /espectro. O Worker dispara este workflow com repository_dispatch
+# (event_type "audio-tool") e manda o payload com os file_id e os parâmetros.
+#
+# O repositório precisa de dois secrets (Settings > Secrets and variables > Actions):
+#   BOT_TOKEN  -> o token do bot (o mesmo do Worker)
+#   (o GITHUB_TOKEN padrão já basta para disparar; o PAT fica no Worker)
+#
+# E o Worker precisa de GITHUB_TOKEN (PAT classic, escopo repo) e GITHUB_REPO.
+
+name: audio-tools
+
+on:
+  repository_dispatch:
+    types: [audio-tool]
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instala ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Processa o áudio
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: python scripts/audio_tools.py
