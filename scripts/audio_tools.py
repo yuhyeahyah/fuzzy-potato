@@ -75,13 +75,72 @@ def say(text):
     api("sendMessage", {"chat_id": CHAT_ID, "message_thread_id": THREAD_ID, "text": text[:4000]})
 
 
+def make_thumb(audio_path):
+    """O Telegram só mostra a capa no cartão do áudio se ela vier como thumbnail.
+    Tira a capa embutida e reduz para <=320 px / <=200 KB JPEG, como a Bot API exige.
+    Devolve o caminho do thumb ou None (sem capa, ou falha)."""
+    try:
+        raw = Path(audio_path).with_suffix(".cover.jpg")
+        r = subprocess.run(["ffmpeg", "-y", "-i", str(audio_path), "-an", "-map", "0:v:0", "-c:v", "copy", str(raw)],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not raw.exists() or raw.stat().st_size < 100:
+            return None
+        thumb = Path(audio_path).with_suffix(".thumb.jpg")
+        # reduz o lado maior para 320 px e recomprime até caber em 200 KB
+        subprocess.run(["ffmpeg", "-y", "-i", str(raw),
+                        "-vf", "scale='min(320,iw)':'min(320,ih)':force_original_aspect_ratio=decrease",
+                        "-q:v", "5", str(thumb)], capture_output=True, text=True)
+        if not thumb.exists():
+            return None
+        if thumb.stat().st_size > 200 * 1024:  # ainda grande: comprime mais
+            subprocess.run(["ffmpeg", "-y", "-i", str(raw),
+                            "-vf", "scale='min(256,iw)':'min(256,ih)':force_original_aspect_ratio=decrease",
+                            "-q:v", "8", str(thumb)], capture_output=True, text=True)
+        return thumb if thumb.exists() and thumb.stat().st_size <= 200 * 1024 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def send_audio(path, name, title=None, performer=None, thumb=None):
     size = Path(path).stat().st_size
     if size > MAX_UPLOAD:
         say(f"⚠️ {name}: ficou com {size // (1024*1024)} MB, acima do limite de 50 MB do bot. Não enviei.")
         return False
-    fields = {"chat_id": CHAT_ID, "message_thread_id": THREAD_ID, "title": title, "performer": performer}
-    r = api("sendAudio", fields, "audio", path, name, "audio/mpeg")
+    # a capa fica embutida no MP3, mas o cartão no chat só a exibe via thumbnail
+    thumb = thumb or make_thumb(path)
+    boundary = "----tagbot" + os.urandom(8).hex()
+    out = bytearray()
+
+    def add_field(k, v):
+        nonlocal out
+        if v is None:
+            return
+        out += f"--{boundary}\r\n".encode()
+        out += f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode()
+        out += f"{v}\r\n".encode()
+
+    def add_file(field, fpath, fname, mime):
+        nonlocal out
+        out += f"--{boundary}\r\n".encode()
+        out += f'Content-Disposition: form-data; name="{field}"; filename="{fname}"\r\n'.encode()
+        out += f"Content-Type: {mime}\r\n\r\n".encode()
+        out += Path(fpath).read_bytes() + b"\r\n"
+
+    add_field("chat_id", CHAT_ID)
+    add_field("message_thread_id", THREAD_ID)
+    add_field("title", title)
+    add_field("performer", performer)
+    add_file("audio", path, name, "audio/mpeg")
+    if thumb:
+        add_file("thumbnail", thumb, "thumb.jpg", "image/jpeg")
+    out += f"--{boundary}--\r\n".encode()
+    req = request.Request(f"{API}/sendAudio", data=bytes(out),
+                          headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with request.urlopen(req, timeout=300) as resp:
+            r = json.loads(resp.read())
+    except Exception as e:  # noqa: BLE001
+        r = {"ok": False, "description": str(e)}
     if not r.get("ok"):
         say(f"❌ {name}: {r.get('description')}")
     return r.get("ok", False)
