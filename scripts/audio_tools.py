@@ -150,6 +150,16 @@ def fmt_dur(sec):
 MIME = {"mp3": "audio/mpeg", "flac": "audio/flac", "m4a": "audio/mp4", "ogg": "audio/ogg", "opus": "audio/opus", "wav": "audio/wav"}
 
 
+# A capa de um MP3 é um "stream de vídeo" (imagem anexada). Mapeamos o áudio e,
+# se existir, a imagem (disp:attached_pic), copiando a imagem sem recomprimir.
+# O "?" deixa o -map opcional, para não falhar em arquivo sem capa. Vale para
+# os formatos que guardam capa embutida (mp3, m4a, flac); wav/ogg/opus não levam.
+def cover_map(fmt):
+    if fmt in ("mp3", "m4a", "aac", "flac"):
+        return ["-map", "0:a", "-map", "0:v:0?", "-c:v", "copy", "-disposition:v:0", "attached_pic"]
+    return ["-map", "0:a"]
+
+
 def encode_args(fmt, bitrate):
     """Argumentos de codec do ffmpeg para o formato de saída."""
     if fmt == "mp3":
@@ -178,7 +188,7 @@ def op_converter(tmp):
         name = f"{safe(stem(f['name']) or f.get('title') or 'audio')}.{fmt}"
         dst = tmp / name
         try:
-            run(["ffmpeg", "-y", "-i", str(src), "-map", "0:a", "-map_metadata", "0", *encode_args(fmt, bitrate), str(dst)])
+            run(["ffmpeg", "-y", "-i", str(src), *cover_map(fmt), "-map_metadata", "0", *encode_args(fmt, bitrate), str(dst)])
         except RuntimeError as e:
             say(f"❌ {f['name']}: {e}")
             continue
@@ -206,7 +216,7 @@ def op_cortar(tmp):
         if fade and dur:
             fade_len = min(2.0, dur / 4)
             cmd += ["-af", f"afade=t=in:st=0:d={fade_len:.2f},afade=t=out:st={dur - fade_len:.2f}:d={fade_len:.2f}"]
-        cmd += ["-c:a", "libmp3lame", "-b:a", "320k", "-id3v2_version", "3", str(dst)]
+        cmd += [*cover_map("mp3"), "-map_metadata", "0", "-c:a", "libmp3lame", "-b:a", "320k", "-id3v2_version", "3", str(dst)]
         try:
             run(cmd)
         except RuntimeError as e:
@@ -239,7 +249,7 @@ def op_normalizar(tmp):
                     f":measured_LRA={d['input_lra']}:measured_thresh={d['input_thresh']}"
                     f":offset={d['target_offset']}:linear=true"
                 )
-            run(["ffmpeg", "-y", "-i", str(src), "-af", af, "-map_metadata", "0",
+            run(["ffmpeg", "-y", "-i", str(src), "-af", af, *cover_map("mp3"), "-map_metadata", "0",
                  "-c:a", "libmp3lame", "-b:a", "320k", "-id3v2_version", "3", str(dst)])
         except (RuntimeError, KeyError, ValueError) as e:
             say(f"❌ {f['name']}: {e}")
@@ -254,12 +264,21 @@ def op_juntar(tmp):
     paths = []
     chapters = []
     pos = 0.0
+    cover = None  # capa da 1ª faixa que tiver uma; vai no arquivo final
     for i, f in enumerate(FILES):
         src = download(f["file_id"], tmp / f"in{i}.mp3")
+        # as faixas do concat saem só com áudio (a capa aqui atrapalharia a junção)
         norm = tmp / f"n{i}.mp3"  # tudo para 44.1k estéreo 320k, senão o concat falha com formatos mistos
-        run(["ffmpeg", "-y", "-i", str(src), "-ar", "44100", "-ac", "2",
+        run(["ffmpeg", "-y", "-i", str(src), "-map", "0:a", "-ar", "44100", "-ac", "2",
              "-c:a", "libmp3lame", "-b:a", "320k", str(norm)])
         paths.append(norm)
+        if cover is None:
+            pic = tmp / f"cover{i}.jpg"
+            # extrai a capa, se houver (código 0 = achou e gravou a imagem)
+            r = subprocess.run(["ffmpeg", "-y", "-i", str(src), "-an", "-map", "0:v:0", "-c:v", "copy", str(pic)],
+                               capture_output=True, text=True)
+            if r.returncode == 0 and pic.exists() and pic.stat().st_size > 100:
+                cover = pic
         dur = float(f.get("duration") or 0)
         if not dur:
             pr = subprocess.run(["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
@@ -281,8 +300,14 @@ def op_juntar(tmp):
     meta.write_text("\n".join(lines) + "\n")
 
     out = tmp / f"{name}.{fmt}"
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile), "-i", str(meta),
-           "-map_metadata", "1", *encode_args(fmt, None), str(out)]
+    # entradas: 0 = áudio juntado, 1 = capítulos, 2 = capa (se houver)
+    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile), "-i", str(meta)]
+    with_cover = cover is not None and fmt in ("mp3", "m4a", "flac")
+    if with_cover:
+        cmd += ["-i", str(cover), "-map", "0:a", "-map", "2:v", "-c:v", "copy", "-disposition:v:0", "attached_pic"]
+    else:
+        cmd += ["-map", "0:a"]
+    cmd += ["-map_metadata", "1", *encode_args(fmt, None), str(out)]
     try:
         run(cmd)
     except RuntimeError as e:
