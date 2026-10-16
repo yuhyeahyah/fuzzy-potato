@@ -1,12 +1,16 @@
-# Processa áudio com ffmpeg para os comandos /converter, /cortar, /normalizar,
-# /juntar e /espectro. O Worker dispara este workflow com repository_dispatch
-# (event_type "audio-tool") e manda o payload com os file_id e os parâmetros.
+# Processa áudio no GitHub Actions: /info (detalhado), /capa, /limpar, /renomear, /tag
+# (arquivos acima de 20 MB) e /converter, /cortar, /normalizar, /juntar, /espectro.
+# O Worker dispara este workflow por repository_dispatch (event_type "audio-tool").
 #
-# O repositório precisa de dois secrets (Settings > Secrets and variables > Actions):
-#   BOT_TOKEN  -> o token do bot (o mesmo do Worker)
-#   (o GITHUB_TOKEN padrão já basta para disparar; o PAT fica no Worker)
+# Secrets do repositório (Settings > Secrets and variables > Actions):
+#   BOT_TOKEN    -> o token do bot (o mesmo do Worker)
+#   TG_API_ID    -> api_id de https://my.telegram.org (API development tools)
+#   TG_API_HASH  -> api_hash do mesmo lugar
+# TG_API_ID/TG_API_HASH só são usados para arquivos acima de 20 MB: o limite de download
+# da Bot API é 20 MB para qualquer cliente HTTP (Worker ou Actions), então o script baixa
+# (e, acima de 50 MB, envia) por MTProto, logando o próprio bot.
 #
-# E o Worker precisa de GITHUB_TOKEN (PAT classic, escopo repo) e GITHUB_REPO.
+# No Worker: GITHUB_TOKEN (PAT classic, escopo repo) e GITHUB_REPO ("usuario/repositorio").
 
 name: audio-tools
 
@@ -17,21 +21,26 @@ on:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Instala ffmpeg
+      - name: Instala ffmpeg e exiftool
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg libimage-exiftool-perl
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+      - name: Instala dependências Python
+        run: pip install mutagen kurigram tgcrypto
+
       - name: Processa o áudio
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: python scripts/audio_tools.py
