@@ -22,7 +22,6 @@ SOBRE O LIMITE DE 20 MB
     Arquivos até 20 MB continuam indo pela Bot API HTTP, sem depender disso.
 """
 
-import atexit
 import json
 import os
 import re
@@ -118,14 +117,16 @@ def mt():
     _MT = Client("tagbot", api_id=int(os.environ["TG_API_ID"]), api_hash=os.environ["TG_API_HASH"],
                  bot_token=BOT_TOKEN, in_memory=True, no_updates=True)
     _MT.start()
-    atexit.register(_mt_stop)
     return _MT
 
 
 def _mt_stop():
+    """Fecha o cliente MTProto. Tem que ser chamado ANTES de o Python encerrar (ver main())."""
+    global _MT
+    c, _MT = _MT, None
     try:
-        if _MT is not None:
-            _MT.stop()
+        if c is not None:
+            c.stop()
     except Exception:  # noqa: BLE001
         pass
 
@@ -1031,6 +1032,8 @@ def main():
         except Exception as e:  # noqa: BLE001
             say(f"Falhou no /{OP}: {e}")
             raise
+        finally:
+            _mt_stop()  # fecha o MTProto antes do Python desligar as threads (evita o erro "cannot schedule new futures")
 
 
 if __name__ == "__main__":
