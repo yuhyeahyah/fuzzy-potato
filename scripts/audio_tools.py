@@ -550,7 +550,7 @@ def summarize(meta, f, path, kind, chunk_lines):
         row("Amostragem", f"{int(sr) / 1000:g} kHz" if sr else None),
         row("Profundidade", f"{bits} bits" if bits else None),
         row("Formato da amostra", None if bits else a.get("sample_fmt")),
-        row("Canais", f"{a.get('channels')} ({a.get('channel_layout', '?')})" if a.get("channels") else None),
+        row("Canais", (f"{a.get('channels')} ({a['channel_layout']})" if a.get("channel_layout") not in (None, "", "unknown") else str(a.get("channels"))) if a.get("channels") else None),
         row("Bitrate do áudio", f"{int(a['bit_rate']) // 1000} kbps" if a.get("bit_rate") else None),
     ) if r]
     extra = []
@@ -558,7 +558,7 @@ def summarize(meta, f, path, kind, chunk_lines):
         extra.append(f"Capa: <b>{esc(v.get('codec_name', '?'))} {v.get('width', '?')}×{v.get('height', '?')}</b>")
     if meta.get("chapters"):
         extra.append(f"Capítulos: <b>{len(meta['chapters'])}</b>")
-    top_chunks = [m.group(1) for m in (re.match(r"^\[(\S+)\]", l) for l in chunk_lines) if m]
+    top_chunks = [m.group(1).strip() for m in (re.match(r"^\[([^\]]+)\]", l) for l in chunk_lines) if m]
     if top_chunks:
         extra.append(f"Estrutura ({esc(kind)}): <code>{esc(' '.join(top_chunks[:20]))}</code>")
 
