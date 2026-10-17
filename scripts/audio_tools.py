@@ -1208,12 +1208,11 @@ def op_yt(tmp):
 
     if fmt == "video":
         h = int(ARGS.get("height") or 720)
-        sel = fsel or f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/b[height<={h}][ext=mp4]/bv*[height<={h}]+ba/b[height<={h}]"
+        sel = fsel or f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/b[height<={h}][ext=mp4]/bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
         cmd += ["-f", sel, "--merge-output-format", "mp4", "--embed-metadata"]
     else:
-        if fsel:
-            cmd += ["-f", fsel]
-        cmd += ["-x", "--audio-format", fmt]
+        # "ba*" aceita formato com áudio mesmo que traga vídeo junto (Twitter, TikTok...): o -x descarta o vídeo
+        cmd += ["-f", fsel or "ba*/ba/b", "-x", "--audio-format", fmt]
         if fmt in ("mp3", "m4a", "opus") and ARGS.get("bitrate"):
             cmd += ["--audio-quality", f"{int(ARGS['bitrate'])}K"]
         elif fmt == "mp3":
