@@ -1,5 +1,5 @@
 # Processa áudio no GitHub Actions: /info (detalhado), /capa, /limpar, /renomear, /tag
-# (arquivos acima de 20 MB) e /converter, /cortar, /normalizar, /juntar, /espectro.
+# (arquivos acima de 20 MB) e /converter, /cortar, /normalizar, /juntar, /espectro e /yt (yt-dlp).
 # O Worker dispara este workflow por repository_dispatch (event_type "audio-tool").
 #
 # Secrets do repositório (Settings > Secrets and variables > Actions):
@@ -9,6 +9,11 @@
 # TG_API_ID/TG_API_HASH só são usados para arquivos acima de 20 MB: o limite de download
 # da Bot API é 20 MB para qualquer cliente HTTP (Worker ou Actions), então o script baixa
 # (e, acima de 50 MB, envia) por MTProto, logando o próprio bot.
+#
+#   YT_COOKIES   -> (opcional, /yt) conteúdo de um cookies.txt do YouTube, formato Netscape.
+#                   Sem ele o YouTube costuma bloquear o IP do GitHub Actions.
+#   YT_PROXIES   -> (opcional, /yt pais=xx) JSON {"nz": "socks5://user:senha@host:porta"}.
+#                   Proxy/VPN que sai no país escolhido: é o que realmente contorna bloqueio regional.
 #
 # No Worker: GITHUB_TOKEN (PAT classic, escopo repo) e GITHUB_REPO ("usuario/repositorio").
 
@@ -35,12 +40,14 @@ jobs:
           python-version: "3.12"
 
       - name: Instala dependências Python
-        run: pip install mutagen kurigram tgcrypto
+        run: pip install mutagen kurigram tgcrypto "yt-dlp[default]"
 
       - name: Processa o áudio
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          YT_PROXIES: ${{ secrets.YT_PROXIES }}
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: python scripts/audio_tools.py
