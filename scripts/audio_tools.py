@@ -1136,8 +1136,19 @@ def album_process(tmp, files, marca):
         except Exception:  # noqa: BLE001
             pass
         title = FEAT_RE.sub("", info.get("track") or info.get("title") or f.stem).strip() or f.stem
-        artist = (info.get("artist") or ", ".join(info.get("artists") or [])
-                  or re.sub(r"\s*-\s*Topic$", "", info.get("uploader") or "")).strip()
+
+        def _clean_ch(s):
+            return re.sub(r"\s*-\s*Topic$", "", (s or "").strip(), flags=re.I).strip()
+
+        artists = info.get("artists") or []
+        ch = _clean_ch(info.get("channel") or info.get("uploader") or info.get("playlist_uploader"))
+        if ch and (not artists or ch.lower() in [a.lower() for a in artists]):
+            artist = ch
+        elif artists:
+            artist = artists[0]
+        else:
+            artist = (info.get("artist") or "").split(",")[0].strip() or ch
+
         album = (ALBUM_PREFIX_RE.sub("", info.get("playlist_title") or "").strip() or info.get("album") or "").strip()
         track = int(info.get("playlist_index") or info.get("track_number") or i + 1)
         if marca and FORCE_YEAR:
