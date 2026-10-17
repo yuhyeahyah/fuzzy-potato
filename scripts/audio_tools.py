@@ -6,7 +6,7 @@ Chamado pelo workflow audio-tools.yml (repository_dispatch, event_type "audio-to
 Payload enviado pelo Worker:
 
     op        : info | capa | limpar | renomear | tag |
-                converter | cortar | normalizar | juntar | espectro
+                converter | cortar | normalizar | juntar | espectro | yt
     args      : parâmetros do comando (depende do op)
     chat_id   : chat de destino
     thread_id : tópico de destino (pode ser null)
@@ -148,6 +148,9 @@ def mt_send(kind, path, name, title=None, performer=None, duration=None, thumb=N
             c.send_audio(audio=str(path), file_name=name, title=title, performer=performer,
                          duration=int(duration or 0), thumb=str(thumb) if thumb else None,
                          caption=caption, **kw)
+        elif kind == "video":
+            c.send_video(video=str(path), file_name=name, duration=int(duration or 0),
+                         supports_streaming=True, caption=caption, **kw)
         elif kind == "photo":
             c.send_photo(photo=str(path), caption=caption, **kw)
         else:
@@ -233,6 +236,23 @@ def send_document(path, name, caption=None):
     r = api("sendDocument", {"chat_id": CHAT_ID, "message_thread_id": THREAD_ID, "caption": caption,
                              "disable_content_type_detection": "true"},
             [("document", path, name, "application/octet-stream")])
+    if not r.get("ok"):
+        say(f"❌ {name}: {r.get('description')}")
+    return r.get("ok", False)
+
+
+def send_video(path, name, caption=None, duration=None, width=None, height=None):
+    path = Path(path)
+    size = path.stat().st_size
+    if size > MAX_UPLOAD:
+        if not mt_ready():
+            return _too_big_warning(name, size)
+        return mt_send("video", path, name, duration=duration, caption=caption)
+    r = api("sendVideo", {"chat_id": CHAT_ID, "message_thread_id": THREAD_ID, "caption": caption,
+                          "supports_streaming": "true",
+                          "duration": int(duration) if duration else None,
+                          "width": width, "height": height},
+            [("video", path, name, "video/mp4")])
     if not r.get("ok"):
         say(f"❌ {name}: {r.get('description')}")
     return r.get("ok", False)
@@ -1005,6 +1025,251 @@ def op_espectro(tmp):
     say(f"🎛 /espectro: {ok}/{len(FILES)} imagem(ns).")
 
 
+# ---------- /yt (yt-dlp) ----------
+# Não recebe arquivos: recebe uma URL em ARGS["url"].
+# ARGS: url, fmt (mp3|m4a|flac|opus|wav|video), bitrate, height, format_id (-f), playlist, max,
+#       list (só listar formatos), country (código de 2 letras), album, marca
+#
+# Secrets opcionais:
+#   YT_COOKIES  -> cookies.txt (Netscape). O YouTube costuma bloquear o IP do GitHub Actions.
+#   YT_PROXIES  -> JSON {"nz": "socks5://usuario:senha@host:porta", "us": "http://..."}
+#                  Um proxy/VPN no país é a ÚNICA forma confiável de acessar conteúdo bloqueado por região.
+#                  Sem proxy para o país pedido, o script tenta --geo-bypass-country (só engana alguns sites).
+
+BRAND = "The Unreleased Collection"
+BRAND_URL = "t.me/theunreleasedmusic"
+FORCE_YEAR = "2026"  # usado com "marca"; deixe "" para usar o ano real
+
+YT_AUDIO_EXT = {".mp3", ".m4a", ".flac", ".opus", ".wav", ".ogg", ".aac"}
+YT_VIDEO_EXT = {".mp4", ".mkv", ".webm", ".mov"}
+FEAT_RE = re.compile(r"\s*[\(\[]feat\.[^\)\]]*[\)\]]", re.I)
+ALBUM_PREFIX_RE = re.compile(r"^Album\s*[-\u2013\u2014]\s*", re.I)
+GEO_RE = re.compile(r"not available in your country|geo.?restrict|blocked in your country|not made this video available|available in your", re.I)
+
+
+def yt_proxy_for(country):
+    try:
+        m = json.loads(os.environ.get("YT_PROXIES") or "{}")
+    except ValueError:
+        return None
+    return m.get((country or "").lower())
+
+
+def yt_redact(text):
+    """Tira credenciais de proxy de qualquer mensagem de erro antes de mandar pro chat."""
+    try:
+        for v in json.loads(os.environ.get("YT_PROXIES") or "{}").values():
+            text = text.replace(v, "***")
+    except ValueError:
+        pass
+    return re.sub(r"(\w+://)[^/\s@]+@", r"\1***@", text)
+
+
+def yt_base(tmp, country):
+    """Comando base do yt-dlp + o método de contorno geográfico usado: None | 'proxy' | 'header'."""
+    cmd = ["yt-dlp", "--no-warnings", "--js-runtimes", "node"]
+    cookies = os.environ.get("YT_COOKIES", "").strip()
+    if cookies:
+        cf = tmp / "cookies.txt"
+        cf.write_text(cookies + "\n", encoding="utf-8")
+        cmd += ["--cookies", str(cf)]
+    method = None
+    if country:
+        proxy = yt_proxy_for(country)
+        if proxy:
+            cmd += ["--proxy", proxy]
+            method = "proxy"
+        else:
+            cmd += ["--geo-bypass-country", country.upper()]
+            method = "header"
+    return cmd, method
+
+
+def yt_err(p):
+    lines = [l for l in (p.stderr or "").splitlines() if "ERROR" in l]
+    last = lines[-1] if lines else ((p.stderr or p.stdout or "yt-dlp falhou").strip().splitlines() or ["yt-dlp falhou"])[-1]
+    return yt_redact(last)[:300], bool(lines)
+
+
+def yt_hint(err, country, method):
+    if re.search(r"sign in|not a bot|confirm you", err, re.I):
+        return "\n(O YouTube bloqueou o IP do GitHub Actions. Crie o secret YT_COOKIES com um cookies.txt de uma conta logada.)"
+    if GEO_RE.search(err):
+        if not country:
+            return "\n(Bloqueio regional. Tente de novo com pais=nz (ou o código do país onde o conteúdo está liberado).)"
+        if method == "header":
+            return (f"\n(Sem proxy configurado para '{country}': só tentei --geo-bypass-country, que engana poucos sites. "
+                    f"Para funcionar de verdade, adicione um proxy/VPN desse país no secret YT_PROXIES.)")
+        return f"\n(Mesmo pelo proxy '{country}' o conteúdo foi recusado: confira se o proxy realmente sai nesse país.)"
+    return ""
+
+
+def yt_list(tmp, url, country):
+    cmd, method = yt_base(tmp, country)
+    p = subprocess.run(cmd + ["--no-playlist", "-F", "--", url], capture_output=True, text=True, timeout=300)
+    out = yt_redact((p.stdout or "").strip())
+    if p.returncode != 0 or not out:
+        err, _ = yt_err(p)
+        say(f"❌ /yt formatos: {err}{yt_hint(err, country, method)}")
+        return
+    lines = out.splitlines()
+    table = [l for l in lines if re.match(r"^(ID|[-\u2500]+|\S+\s+(mp4|m4a|webm|mp3|opus|flac|mov|3gp|mhtml|ogg|wav))", l)]
+    body = "\n".join(table or lines)
+    note = ("\n\nPara baixar um formato: /yt &lt;link&gt; f=ID (ex.: f=251 ou f=137+140).\n"
+            "Áudio sem vídeo aparece como 'audio only'.")
+    say(f"<b>Formatos disponíveis</b>\n<pre>{esc(body[:3300])}</pre>{note}", html=True)
+    if len(body) > 3300:
+        txt = tmp / "formatos.txt"
+        txt.write_text(out, encoding="utf-8")
+        send_document(txt, "formatos.txt", caption="Lista completa de formatos")
+
+
+def album_process(tmp, files, marca):
+    """Tags no estilo do seu pipeline: info.json do yt-dlp -> ID3v2.3 via mutagen, capa quadrada, nome 'NN Título [marca].mp3'."""
+    from mutagen.id3 import APIC, COMM, ID3, TALB, TENC, TIT2, TPE1, TPE2, TRCK, TXXX, TYER
+
+    done = []
+    for i, f in enumerate(files):
+        info = {}
+        try:
+            info = json.loads((f.parent / f"{f.stem}.info.json").read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            pass
+        title = FEAT_RE.sub("", info.get("track") or info.get("title") or f.stem).strip() or f.stem
+        artist = (info.get("artist") or ", ".join(info.get("artists") or [])
+                  or re.sub(r"\s*-\s*Topic$", "", info.get("uploader") or "")).strip()
+        album = (ALBUM_PREFIX_RE.sub("", info.get("playlist_title") or "").strip() or info.get("album") or "").strip()
+        track = int(info.get("playlist_index") or info.get("track_number") or i + 1)
+        if marca and FORCE_YEAR:
+            year = FORCE_YEAR
+        else:
+            year = str(info.get("release_year") or (info.get("release_date") or info.get("upload_date") or "")[:4] or "")
+
+        tags = ID3()  # vazio: equivale ao "-map_metadata -1" do seu comando
+        tags.add(TIT2(encoding=1, text=[title]))
+        if artist:
+            tags.add(TPE1(encoding=1, text=[artist]))
+            tags.add(TPE2(encoding=1, text=[artist]))
+        if album:
+            tags.add(TALB(encoding=1, text=[album]))
+        tags.add(TRCK(encoding=1, text=[str(track)]))
+        if year:
+            tags.add(TYER(encoding=1, text=[year]))
+        if marca:
+            tags.add(COMM(encoding=1, lang="eng", desc="", text=[BRAND]))
+            tags.add(TENC(encoding=1, text=[BRAND]))
+            for d in ("description", "synopsis", "purl"):
+                tags.add(TXXX(encoding=1, desc=d, text=[BRAND]))
+            tags.add(TXXX(encoding=1, desc="TELEGRAM URL", text=[BRAND_URL]))
+
+        thumb = f.parent / f"{f.stem}.jpg"
+        if thumb.exists():
+            sq = f.parent / f"{f.stem}.sq.jpg"
+            subprocess.run(["ffmpeg", "-y", "-i", str(thumb), "-vf",
+                            "crop=min(iw\\,ih):min(iw\\,ih):(iw-min(iw\\,ih))/2:(ih-min(iw\\,ih))/2",
+                            "-q:v", "2", str(sq)], capture_output=True)
+            src = sq if sq.exists() and sq.stat().st_size > 100 else thumb
+            tags.add(APIC(encoding=0, mime="image/jpeg", type=3, desc="", data=src.read_bytes()))
+
+        tags.save(str(f), v2_version=3)
+        name = safe(f"{track:02d} {title} [{BRAND}]" if marca else f"{track:02d} - {title}") + ".mp3"
+        new = f.with_name(name)
+        f.replace(new)
+        done.append((new, title, artist))
+    return done
+
+
+def op_yt(tmp):
+    url = (ARGS.get("url") or "").strip()
+    if not re.match(r"^https?://", url):
+        say("URL inválida: preciso de um link http(s).")
+        return
+    country = (ARGS.get("country") or "").lower()
+    if country and not re.fullmatch(r"[a-z]{2}", country):
+        say("País inválido: use o código de 2 letras (nz, us, jp, br...).")
+        return
+    if ARGS.get("list"):
+        yt_list(tmp, url, country)
+        return
+
+    marca = bool(ARGS.get("marca"))
+    album = bool(ARGS.get("album")) or marca
+    fmt = "mp3" if album else (ARGS.get("fmt") or "mp3")
+    playlist = bool(ARGS.get("playlist")) or (album and bool(re.search(r"[?&]list=|/playlist", url)))
+    maxn = max(1, min(int(ARGS.get("max") or 25), 50))
+    fsel = (ARGS.get("format_id") or "").strip()
+    if fsel and (fsel.startswith("-") or not re.fullmatch(r"[A-Za-z0-9+\-/_.*]{1,60}", fsel)):
+        say("Formato inválido. Use o ID mostrado em /yt formatos (ex.: 251 ou 137+140).")
+        return
+
+    cmd, method = yt_base(tmp, country)
+    cmd += ["--ignore-errors", "--no-mtime", "-o", str(tmp / "%(playlist_index&{} - |)s%(title).120B.%(ext)s")]
+    cmd += ["--yes-playlist", "--playlist-end", str(maxn)] if playlist else ["--no-playlist"]
+
+    if fmt == "video":
+        h = int(ARGS.get("height") or 720)
+        sel = fsel or f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/b[height<={h}][ext=mp4]/bv*[height<={h}]+ba/b[height<={h}]"
+        cmd += ["-f", sel, "--merge-output-format", "mp4", "--embed-metadata"]
+    else:
+        if fsel:
+            cmd += ["-f", fsel]
+        cmd += ["-x", "--audio-format", fmt]
+        if fmt in ("mp3", "m4a", "opus") and ARGS.get("bitrate"):
+            cmd += ["--audio-quality", f"{int(ARGS['bitrate'])}K"]
+        elif fmt == "mp3":
+            cmd += ["--audio-quality", "0"]
+        if album:
+            # as tags e a capa são feitas depois, em Python (album_process)
+            cmd += ["--write-info-json", "--no-write-playlist-metafiles", "--write-thumbnail", "--convert-thumbnails", "jpg"]
+        else:
+            cmd += ["--embed-metadata"]
+            if fmt != "wav":
+                cmd += ["--embed-thumbnail", "--convert-thumbnails", "jpg"]
+
+    cmd += ["--", url]  # "--" impede que a URL seja lida como opção
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=25 * 60)
+    except subprocess.TimeoutExpired:
+        say("❌ /yt: passou de 25 minutos e foi interrompido.")
+        return
+
+    exts = YT_VIDEO_EXT if fmt == "video" else YT_AUDIO_EXT
+    files = sorted((x for x in tmp.iterdir() if x.is_file() and x.suffix.lower() in exts), key=lambda x: x.stat().st_mtime)
+    err, had_err = yt_err(p)
+
+    if not files:
+        say(f"❌ /yt: {err}{yt_hint(err, country, method)}")
+        return
+
+    ok = 0
+    if album and fmt == "mp3":
+        items = album_process(tmp, files, marca)
+        for path, title, artist in items:
+            dur = float((probe_json(path).get("format") or {}).get("duration") or 0)
+            ok += send_audio(path, path.name, title, artist or None, duration=dur)
+    else:
+        for f in files:
+            meta = probe_json(f)
+            fm = meta.get("format", {})
+            tags = {k.lower(): v for k, v in (fm.get("tags") or {}).items()}
+            title = tags.get("title") or stem(f.name)
+            artist = tags.get("artist") or None
+            dur = float(fm.get("duration") or 0)
+            name = safe(f.name)
+            if fmt == "video":
+                v = next((s for s in meta.get("streams", []) if s.get("codec_type") == "video"), {})
+                ok += send_video(f, name, caption=title[:900], duration=dur, width=v.get("width"), height=v.get("height"))
+            elif f.suffix.lower() in AUDIO_AS_AUDIO:
+                ok += send_audio(f, name, title, artist, duration=dur)
+            else:
+                ok += send_document(f, name)
+
+    via = {"proxy": f" via proxy {country.upper()}", "header": f" (geo-bypass {country.upper()}, sem proxy)"}.get(method, "")
+    extra = f" ({len(files)} de uma playlist)" if playlist else ""
+    warn = f"\n⚠️ Alguns itens falharam: {err}" if ok < len(files) or (playlist and had_err) else ""
+    say(f"▶️ /yt {'álbum' if album else fmt}{via}: {ok}/{len(files)} arquivo(s){extra}.{warn}")
+
+
 OPS = {
     "info": op_info,
     "capa": op_capa,
@@ -1016,6 +1281,7 @@ OPS = {
     "normalizar": op_normalizar,
     "juntar": op_juntar,
     "espectro": op_espectro,
+    "yt": op_yt,
 }
 
 
@@ -1023,7 +1289,7 @@ def main():
     if OP not in OPS:
         say(f"Operação desconhecida: {OP}")
         return
-    if not FILES:
+    if not FILES and OP != "yt":
         say("Nenhum arquivo recebido.")
         return
     with tempfile.TemporaryDirectory() as d:
