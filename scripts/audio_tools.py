@@ -1143,14 +1143,14 @@ def album_process(tmp, files, marca):
         def _clean_ch(s):
             return re.sub(r"\s*-\s*Topic$", "", (s or "").strip(), flags=re.I).strip()
 
-        artists = info.get("artists") or []
+        artists = [a.strip() for a in (info.get("artists") or []) if a and a.strip()]
         ch = _clean_ch(info.get("channel") or info.get("uploader") or info.get("playlist_uploader"))
-        if ch and (not artists or ch.lower() in [a.lower() for a in artists]):
-            artist = ch
-        elif artists:
-            artist = artists[0]
+        if artists:
+            artist = ", ".join(artists)  # TPE1: todos os artistas (ex.: "Olivia Rodrigo, Chappell Roan")
+            main = ch if ch.lower() in [a.lower() for a in artists] else artists[0]
         else:
-            artist = (info.get("artist") or "").split(",")[0].strip() or ch
+            artist = (info.get("artist") or "").strip() or ch  # o campo "artist" do yt-dlp já vem "A, B"
+            main = artist.split(",")[0].strip() or ch
 
         album = (ALBUM_PREFIX_RE.sub("", info.get("playlist_title") or "").strip() or info.get("album") or "").strip()
         track = int(info.get("playlist_index") or info.get("track_number") or i + 1)
@@ -1163,7 +1163,7 @@ def album_process(tmp, files, marca):
         tags.add(TIT2(encoding=1, text=[title]))
         if artist:
             tags.add(TPE1(encoding=1, text=[artist]))
-            tags.add(TPE2(encoding=1, text=[artist]))
+            tags.add(TPE2(encoding=1, text=[main or artist]))  # artista do álbum: só o principal
         if album:
             tags.add(TALB(encoding=1, text=[album]))
         tags.add(TRCK(encoding=1, text=[str(track)]))
