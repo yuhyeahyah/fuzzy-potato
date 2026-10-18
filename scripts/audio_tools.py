@@ -1127,6 +1127,26 @@ def yt_list(tmp, url, country):
         send_document(txt, "formatos.txt", caption="Lista completa de formatos")
 
 
+VOCAL_ROLE_RE = re.compile(r"^(?:lead\s+|main\s+)?(?:vocalist|vocals?|featured\s+artist|main\s+artist|rapper)$", re.I)
+
+
+def yt_performers(info, artists, main):
+    """Quem canta de verdade. O campo 'artists' do yt-dlp traz também compositores e produtores
+    (ex.: IVE + 5 autores). Pela descrição ('Vocalist: X', 'Composer Lyricist, Vocalist: Y') ficam só o
+    artista principal e quem tem papel de vocal/participação. Sem créditos na descrição, vale a lista inteira."""
+    roles, parsed = {}, False
+    for line in (info.get("description") or "").splitlines():
+        m = re.match(r"^\s*([^:\u00b7]{2,120}?):\s*(.+?)\s*$", line)
+        if not m or m.group(1).strip().lower() == "released on":
+            continue
+        parsed = True
+        roles.setdefault(m.group(2).strip().lower(), set()).update(r.strip() for r in m.group(1).split(","))
+    if not parsed:
+        return list(artists)
+    others = [a for a in artists if a != main and any(VOCAL_ROLE_RE.match(r) for r in roles.get(a.lower(), ()))]
+    return [main] + others
+
+
 def album_process(tmp, files, marca):
     """Tags no estilo do seu pipeline: info.json do yt-dlp -> ID3v2.3 via mutagen, capa quadrada, nome 'NN Título [marca].mp3'."""
     from mutagen.id3 import APIC, COMM, ID3, TALB, TENC, TIT2, TPE1, TPE2, TRCK, TXXX, TYER
@@ -1146,8 +1166,8 @@ def album_process(tmp, files, marca):
         artists = [a.strip() for a in (info.get("artists") or []) if a and a.strip()]
         ch = _clean_ch(info.get("channel") or info.get("uploader") or info.get("playlist_uploader"))
         if artists:
-            artist = ", ".join(artists)  # TPE1: todos os artistas (ex.: "Olivia Rodrigo, Chappell Roan")
-            main = ch if ch.lower() in [a.lower() for a in artists] else artists[0]
+            main = next((a for a in artists if ch and a.lower() == ch.lower()), artists[0])
+            artist = ", ".join(yt_performers(info, artists, main))  # TPE1: só quem canta (ex.: "Olivia Rodrigo, Chappell Roan")
         else:
             artist = (info.get("artist") or "").strip() or ch  # o campo "artist" do yt-dlp já vem "A, B"
             main = artist.split(",")[0].strip() or ch
