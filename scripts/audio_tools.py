@@ -1027,7 +1027,7 @@ def op_espectro(tmp):
 
 # ---------- /yt (yt-dlp) ----------
 # Não recebe arquivos: recebe uma URL em ARGS["url"].
-# ARGS: url, fmt (mp3|m4a|flac|opus|wav|video), bitrate, height, format_id (-f), playlist, max,
+# ARGS: url, fmt (mp3|m4a|flac|opus|wav|video), bitrate, height, format_id (-f), playlist, max, items ("3-7" ou "3,4,5"),
 #       list (só listar formatos), country (código de 2 letras), album, marca
 #
 # Secrets opcionais:
@@ -1048,6 +1048,25 @@ YT_VIDEO_EXT = {".mp4", ".mkv", ".webm", ".mov"}
 FEAT_RE = re.compile(r"\s*[\(\[]feat\.[^\)\]]*[\)\]]", re.I)
 ALBUM_PREFIX_RE = re.compile(r"^Album\s*[-\u2013\u2014]\s*", re.I)
 GEO_RE = re.compile(r"not available in your country|geo.?restrict|blocked in your country|not made this video available|available in your", re.I)
+
+
+YT_ITEMS_RE = re.compile(r"^\d{1,3}(?:-\d{1,3})?(?:,\d{1,3}(?:-\d{1,3})?)*$")
+
+
+def yt_items_count(spec):
+    """Valida o --playlist-items ('3-7' ou '3,4,5,6,7' ou '1-3,8') e devolve quantas faixas pede; None se for inválido."""
+    if not YT_ITEMS_RE.match(spec or ""):
+        return None
+    nums = set()
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        lo, hi = int(a), int(b or a)
+        if lo < 1 or hi < lo:
+            return None
+        nums.update(range(lo, hi + 1))
+        if len(nums) > 50:
+            return None
+    return len(nums)
 
 
 def yt_proxy_for(country):
@@ -1227,13 +1246,17 @@ def op_yt(tmp):
         yt_list(tmp, url, country)
         return
 
+    items = (ARGS.get("items") or "").strip().replace(" ", "")
+    if items and not yt_items_count(items):
+        say("Faixas inválidas. Use um intervalo (3-7) ou uma lista (3,4,5,6,7), no máximo 50 faixas, sem espaços.")
+        return
     marca = bool(ARGS.get("marca"))
     if marca and not BRAND:
         say("⚠️ Secret YT_BRAND não configurado: vou gerar o álbum sem marca.")
         marca = False
     album = bool(ARGS.get("album")) or marca
     fmt = "mp3" if album else (ARGS.get("fmt") or "mp3")
-    playlist = bool(ARGS.get("playlist")) or (album and bool(re.search(r"[?&]list=|/playlist", url)))
+    playlist = bool(ARGS.get("playlist")) or bool(items) or (album and bool(re.search(r"[?&]list=|/playlist", url)))
     maxn = max(1, min(int(ARGS.get("max") or 25), 50))
     fsel = (ARGS.get("format_id") or "").strip()
     if fsel and (fsel.startswith("-") or not re.fullmatch(r"[A-Za-z0-9+\-/_.*]{1,60}", fsel)):
@@ -1242,7 +1265,10 @@ def op_yt(tmp):
 
     cmd, method = yt_base(tmp, country)
     cmd += ["--ignore-errors", "--no-mtime", "-o", str(tmp / "%(playlist_index&{} - |)s%(title).120B.%(ext)s")]
-    cmd += ["--yes-playlist", "--playlist-end", str(maxn)] if playlist else ["--no-playlist"]
+    if items:
+        cmd += ["--yes-playlist", "--playlist-items", items]  # o playlist_index continua sendo o número real da faixa
+    else:
+        cmd += ["--yes-playlist", "--playlist-end", str(maxn)] if playlist else ["--no-playlist"]
 
     if fmt == "video":
         h = int(ARGS.get("height") or 720)
