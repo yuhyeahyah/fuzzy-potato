@@ -14,6 +14,8 @@
 #                   Sem ele o YouTube costuma bloquear o IP do GitHub Actions.
 #   YT_PROXIES   -> (opcional, /yt pais=xx) JSON {"nz": "socks5://user:senha@host:porta"}.
 #                   Proxy/VPN que sai no país escolhido: é o que realmente contorna bloqueio regional.
+#   YT_BRAND     -> (opcional, /yt marca) texto da marca gravado nas tags e no nome do arquivo.
+#   YT_BRAND_URL -> (opcional, /yt marca) link gravado na tag "TELEGRAM URL".
 #
 # No Worker: GITHUB_TOKEN (PAT classic, escopo repo) e GITHUB_REPO ("usuario/repositorio").
 
@@ -49,5 +51,7 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
           YT_PROXIES: ${{ secrets.YT_PROXIES }}
+          YT_BRAND: ${{ secrets.YT_BRAND }}
+          YT_BRAND_URL: ${{ secrets.YT_BRAND_URL }}
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: python scripts/audio_tools.py
