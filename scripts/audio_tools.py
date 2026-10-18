@@ -1039,7 +1039,7 @@ def op_espectro(tmp):
 #                  Um proxy/VPN no país é a ÚNICA forma confiável de acessar conteúdo bloqueado por região.
 #                  Sem proxy para o país pedido, o script tenta --geo-bypass-country (só engana alguns sites).
 #   Sem proxy no YT_PROXIES para o país pedido, o script tenta proxies GRÁTIS das listas públicas do GitHub
-#   (proxifly e proxyscrape, separadas por país), testa cada um (HTTPS + país de saída + YouTube) e usa os que passarem.
+#   (proxifly e proxyscrape) e das APIs do ProxyScrape e do GeoNode, filtradas por país; testa cada um (HTTPS + YouTube + país de saída).
 #   YT_BRAND     -> texto da "marca" gravado nas tags (comment, encoder, description...) e no nome do arquivo.
 #   YT_BRAND_URL -> link gravado na tag "TELEGRAM URL". Opcional.
 #   Sem YT_BRAND, o modo "marca" é ignorado (vira um álbum normal, sem marca).
@@ -1102,7 +1102,7 @@ FREE_PROXY_FALLBACK = True          # False desliga o fallback (volta ao --geo-b
 FREE_PROXY_USE_COOKIES = False      # False: com proxy grátis NÃO manda o YT_COOKIES (protege a conta e evita bloqueio por IP estranho)
 FREE_PROXY_MAX_CANDIDATES = 150     # quantos candidatos testar por vez
 FREE_PROXY_KEEP = 6                 # quantos proxies aprovados (os mais rápidos) tentar no download
-FREE_PROXY_PROBE_TIMEOUT = 8        # segundos por requisição de teste
+FREE_PROXY_PROBE_TIMEOUT = 12       # segundos por requisição de teste (proxy grátis é lento)
 FREE_PROXY_WORKERS = 40
 FREE_PROXY_ATTEMPT_TIMEOUT = 7 * 60 # tempo máximo de UMA tentativa de download com proxy grátis
 FREE_PROXY_BUDGET = 22 * 60         # depois disso não abre tentativa nova (o job do Actions morre aos 30 min)
@@ -1120,32 +1120,51 @@ def _fetch_text(url, timeout=15):
         return ""
 
 
+def _geonode_lines(text):
+    """Converte o JSON do GeoNode em linhas protocolo://ip:porta."""
+    try:
+        rows = json.loads(text).get("data") or []
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for r in rows:
+        for proto in r.get("protocols") or []:
+            if proto in ("http", "socks4", "socks5") and r.get("ip") and r.get("port"):
+                out.append(f"{proto}://{r['ip']}:{r['port']}")
+    return out
+
+
 def yt_free_candidates(country):
     """Baixa as listas do país e devolve URLs de proxy sem repetição, embaralhadas."""
     cc = country.lower()
     sources = [
-        # (urls em ordem de preferência, protocolo padrão quando a linha vem só como ip:porta)
+        # (urls em ordem de preferência, protocolo padrão quando a linha vem só como ip:porta, conversor opcional)
         ([f"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/{cc.upper()}/data.txt",
-          f"https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/{cc.upper()}/data.txt"], None),
+          f"https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/{cc.upper()}/data.txt"], None, None),
+        # API ao vivo do ProxyScrape (mesma base do repositório, mas sem esperar o espelho do GitHub)
+        ([f"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&country={cc}"], None, None),
+        # API do GeoNode (JSON), filtrada por país
+        ([f"https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&country={cc.upper()}"], None, _geonode_lines),
     ]
     for proto in ("socks5", "http", "socks4"):
         sources.append(([f"https://raw.githubusercontent.com/proxyscrape/free-proxy-list/main/proxies/countries/{cc}/{proto}/data.txt",
-                         f"https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/{cc}/{proto}/data.txt"], proto))
+                         f"https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/{cc}/{proto}/data.txt"], proto, None))
     found, seen = [], set()
-    for urls, default in sources:
+    for urls, default, conv in sources:
         text = ""
         for u in urls:  # raw primeiro: o jsDelivr pode servir branch em cache por horas
             text = _fetch_text(u)
             if text.strip():
                 break
-        for line in text.splitlines():
+        lines = conv(text) if conv else text.splitlines()
+        for line in lines:
             m = PROXY_LINE_RE.match(line.strip())
             if not m:
                 continue
             scheme = (m.group(1) or default or "").lower()
             if scheme in ("", "https"):  # sem protocolo conhecido, ou proxy com TLS (o yt-dlp não usa)
                 continue
-            scheme = {"socks5": "socks5h", "socks4": "socks4a"}.get(scheme, scheme)
+            scheme = {"socks5h": "socks5", "socks4a": "socks4"}.get(scheme, scheme)  # DNS local: proxy grátis quase nunca resolve nome
             px = f"{scheme}://{m.group(2)}:{m.group(3)}"
             if px not in seen:
                 seen.add(px)
@@ -1165,28 +1184,32 @@ def _curl(proxy, url, code_only=False):
 
 
 def _probe_proxy(proxy, country):
-    """Segundos gastos se o proxy abre HTTPS, sai no país certo e o YouTube responde; senão None."""
+    """(segundos, motivo): segundos só se o proxy abre HTTPS, o YouTube responde e o país de saída não é outro."""
     t0 = time.time()
-    seen_cc = _curl(proxy, "https://ipinfo.io/country")
-    if seen_cc is None:
-        return None
-    if re.fullmatch(r"[A-Za-z]{2}", seen_cc) and seen_cc.upper() != country.upper():
-        return None  # a etiqueta da lista estava errada
     code = _curl(proxy, "https://www.youtube.com/generate_204", code_only=True)
+    if code is None:
+        return None, "sem conexão HTTPS"
     if not code or code[0] not in "23":
-        return None
-    return time.time() - t0
+        return None, f"YouTube recusou (HTTP {code or '?'})"
+    seen_cc = _curl(proxy, "https://ipinfo.io/country")  # falha da checagem de país não reprova: só um país diferente
+    if seen_cc and re.fullmatch(r"[A-Za-z]{2}", seen_cc) and seen_cc.upper() != country.upper():
+        return None, f"saiu em outro país ({seen_cc.upper()})"
+    return time.time() - t0, "ok"
 
 
 def yt_free_proxies(country):
-    """(proxies aprovados, do mais rápido ao mais lento; quantos candidatos foram testados)."""
+    """(proxies aprovados, do mais rápido ao mais lento; quantos candidatos foram testados; motivos das reprovações)."""
     cands = yt_free_candidates(country)
     if not cands:
-        return [], 0
+        return [], 0, {}
     with ThreadPoolExecutor(max_workers=FREE_PROXY_WORKERS) as ex:
-        times = list(ex.map(lambda px: _probe_proxy(px, country), cands))
-    good = sorted((t, px) for t, px in zip(times, cands) if t is not None)
-    return [px for _, px in good[:FREE_PROXY_KEEP]], len(cands)
+        res = list(ex.map(lambda px: _probe_proxy(px, country), cands))
+    good = sorted((t, px) for (t, _), px in zip(res, cands) if t is not None)
+    why = {}
+    for t, motivo in res:
+        if t is None:
+            why[motivo] = why.get(motivo, 0) + 1
+    return [px for _, px in good[:FREE_PROXY_KEEP]], len(cands), why
 
 
 def yt_routes(country):
@@ -1194,13 +1217,14 @@ def yt_routes(country):
     if not country or not FREE_PROXY_FALLBACK or yt_proxy_for(country):
         return [None], False
     cu = country.upper()
-    say(f"🔎 Sem proxy fixo para {cu} no YT_PROXIES: procurando proxies grátis no GitHub e testando (cerca de 1 minuto)...")
-    routes, n = yt_free_proxies(country)
+    say(f"🔎 Sem proxy fixo para {cu} no YT_PROXIES: procurando proxies grátis (GitHub, ProxyScrape, GeoNode) e testando (cerca de 1 minuto)...")
+    routes, n, why = yt_free_proxies(country)
     if not routes:
+        detalhe = "; ".join(f"{v}× {k}" for k, v in sorted(why.items(), key=lambda kv: -kv[1]))
         say(
-            f"❌ Nenhum proxy grátis de {cu} passou no teste agora ({n} testado(s)). "
-            + ("As listas não têm proxy desse país no momento. " if not n else "")
-            + "Tente de novo daqui a alguns minutos ou configure um proxy fixo no secret YT_PROXIES."
+            f"❌ Nenhum proxy grátis de {cu} passou no teste agora ({n} testado(s))."
+            + (f"\nMotivos: {detalhe}." if detalhe else "\nAs listas não têm proxy desse país no momento.")
+            + "\nTente de novo daqui a alguns minutos ou configure um proxy fixo no secret YT_PROXIES."
         )
         return [], True
     say(f"✅ {len(routes)} proxy(ies) grátis de {cu} passaram no teste (de {n}). Tentando baixar...")
