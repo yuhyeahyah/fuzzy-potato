@@ -27,8 +27,11 @@ import os
 import re
 import shutil
 import subprocess
+import random
 import tempfile
+import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from html import escape as esc
 from pathlib import Path
 from urllib import error, parse, request
@@ -1035,6 +1038,8 @@ def op_espectro(tmp):
 #   YT_PROXIES  -> JSON {"nz": "socks5://usuario:senha@host:porta", "us": "http://..."}
 #                  Um proxy/VPN no país é a ÚNICA forma confiável de acessar conteúdo bloqueado por região.
 #                  Sem proxy para o país pedido, o script tenta --geo-bypass-country (só engana alguns sites).
+#   Sem proxy no YT_PROXIES para o país pedido, o script tenta proxies GRÁTIS das listas públicas do GitHub
+#   (proxifly e proxyscrape, separadas por país), testa cada um (HTTPS + país de saída + YouTube) e usa os que passarem.
 #   YT_BRAND     -> texto da "marca" gravado nas tags (comment, encoder, description...) e no nome do arquivo.
 #   YT_BRAND_URL -> link gravado na tag "TELEGRAM URL". Opcional.
 #   Sem YT_BRAND, o modo "marca" é ignorado (vira um álbum normal, sem marca).
@@ -1087,20 +1092,137 @@ def yt_redact(text):
     return re.sub(r"(\w+://)[^/\s@]+@", r"\1***@", text)
 
 
-def yt_base(tmp, country):
-    """Comando base do yt-dlp + o método de contorno geográfico usado: None | 'proxy' | 'header'."""
+# ---- proxies grátis do GitHub (fallback quando não há YT_PROXIES para o país) ----
+# Listas públicas, atualizadas a cada ~5 min e separadas por país:
+#   proxifly/free-proxy-list     proxies/countries/<CC>/data.txt              linhas "protocolo://ip:porta"
+#   proxyscrape/free-proxy-list  proxies/countries/<cc>/<protocolo>/data.txt  linhas "ip:porta"
+# "Funcionando" nessas listas só quer dizer que o proxy respondeu: não garante que o YouTube aceite o IP,
+# nem que ele saia mesmo no país da etiqueta. Por isso cada candidato é testado aqui antes de ser usado.
+FREE_PROXY_FALLBACK = True          # False desliga o fallback (volta ao --geo-bypass-country, que quase nunca funciona)
+FREE_PROXY_USE_COOKIES = False      # False: com proxy grátis NÃO manda o YT_COOKIES (protege a conta e evita bloqueio por IP estranho)
+FREE_PROXY_MAX_CANDIDATES = 150     # quantos candidatos testar por vez
+FREE_PROXY_KEEP = 6                 # quantos proxies aprovados (os mais rápidos) tentar no download
+FREE_PROXY_PROBE_TIMEOUT = 8        # segundos por requisição de teste
+FREE_PROXY_WORKERS = 40
+FREE_PROXY_ATTEMPT_TIMEOUT = 7 * 60 # tempo máximo de UMA tentativa de download com proxy grátis
+FREE_PROXY_BUDGET = 22 * 60         # depois disso não abre tentativa nova (o job do Actions morre aos 30 min)
+PROXY_LINE_RE = re.compile(r"^(?:(https?|socks4a?|socks5h?)://)?(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})$", re.I)
+# erros que não dependem do proxy: trocar de IP não adianta
+YT_FATAL_RE = re.compile(r"private video|has been removed|account .*terminated|members-only|join this channel|premieres in|confirm your age", re.I)
+
+
+def _fetch_text(url, timeout=15):
+    try:
+        req = request.Request(url, headers={"User-Agent": "Mozilla/5.0 (tagbot)"})
+        with request.urlopen(req, timeout=timeout) as r:
+            return r.read(2_000_000).decode("utf-8", "ignore")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def yt_free_candidates(country):
+    """Baixa as listas do país e devolve URLs de proxy sem repetição, embaralhadas."""
+    cc = country.lower()
+    sources = [
+        # (urls em ordem de preferência, protocolo padrão quando a linha vem só como ip:porta)
+        ([f"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/{cc.upper()}/data.txt",
+          f"https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/{cc.upper()}/data.txt"], None),
+    ]
+    for proto in ("socks5", "http", "socks4"):
+        sources.append(([f"https://raw.githubusercontent.com/proxyscrape/free-proxy-list/main/proxies/countries/{cc}/{proto}/data.txt",
+                         f"https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/{cc}/{proto}/data.txt"], proto))
+    found, seen = [], set()
+    for urls, default in sources:
+        text = ""
+        for u in urls:  # raw primeiro: o jsDelivr pode servir branch em cache por horas
+            text = _fetch_text(u)
+            if text.strip():
+                break
+        for line in text.splitlines():
+            m = PROXY_LINE_RE.match(line.strip())
+            if not m:
+                continue
+            scheme = (m.group(1) or default or "").lower()
+            if scheme in ("", "https"):  # sem protocolo conhecido, ou proxy com TLS (o yt-dlp não usa)
+                continue
+            scheme = {"socks5": "socks5h", "socks4": "socks4a"}.get(scheme, scheme)
+            px = f"{scheme}://{m.group(2)}:{m.group(3)}"
+            if px not in seen:
+                seen.add(px)
+                found.append(px)
+    random.shuffle(found)
+    return found[:FREE_PROXY_MAX_CANDIDATES]
+
+
+def _curl(proxy, url, code_only=False):
+    cmd = ["curl", "-sS", "-m", str(FREE_PROXY_PROBE_TIMEOUT), "-x", proxy, "-A", "Mozilla/5.0"]
+    cmd += ["-o", "/dev/null", "-w", "%{http_code}"] if code_only else []
+    try:
+        p = subprocess.run(cmd + [url], capture_output=True, text=True, timeout=FREE_PROXY_PROBE_TIMEOUT + 3)
+    except Exception:  # noqa: BLE001
+        return None
+    return (p.stdout or "").strip() if p.returncode == 0 else None
+
+
+def _probe_proxy(proxy, country):
+    """Segundos gastos se o proxy abre HTTPS, sai no país certo e o YouTube responde; senão None."""
+    t0 = time.time()
+    seen_cc = _curl(proxy, "https://ipinfo.io/country")
+    if seen_cc is None:
+        return None
+    if re.fullmatch(r"[A-Za-z]{2}", seen_cc) and seen_cc.upper() != country.upper():
+        return None  # a etiqueta da lista estava errada
+    code = _curl(proxy, "https://www.youtube.com/generate_204", code_only=True)
+    if not code or code[0] not in "23":
+        return None
+    return time.time() - t0
+
+
+def yt_free_proxies(country):
+    """(proxies aprovados, do mais rápido ao mais lento; quantos candidatos foram testados)."""
+    cands = yt_free_candidates(country)
+    if not cands:
+        return [], 0
+    with ThreadPoolExecutor(max_workers=FREE_PROXY_WORKERS) as ex:
+        times = list(ex.map(lambda px: _probe_proxy(px, country), cands))
+    good = sorted((t, px) for t, px in zip(times, cands) if t is not None)
+    return [px for _, px in good[:FREE_PROXY_KEEP]], len(cands)
+
+
+def yt_routes(country):
+    """Lista de proxies para tentar: [None] = sem proxy ou proxy fixo do YT_PROXIES; [] = nada funcionou."""
+    if not country or not FREE_PROXY_FALLBACK or yt_proxy_for(country):
+        return [None], False
+    cu = country.upper()
+    say(f"🔎 Sem proxy fixo para {cu} no YT_PROXIES: procurando proxies grátis no GitHub e testando (cerca de 1 minuto)...")
+    routes, n = yt_free_proxies(country)
+    if not routes:
+        say(
+            f"❌ Nenhum proxy grátis de {cu} passou no teste agora ({n} testado(s)). "
+            + ("As listas não têm proxy desse país no momento. " if not n else "")
+            + "Tente de novo daqui a alguns minutos ou configure um proxy fixo no secret YT_PROXIES."
+        )
+        return [], True
+    say(f"✅ {len(routes)} proxy(ies) grátis de {cu} passaram no teste (de {n}). Tentando baixar...")
+    return routes, True
+
+
+def yt_base(tmp, country, free_proxy=None):
+    """Comando base do yt-dlp + o método de contorno geográfico usado: None | 'proxy' | 'free' | 'header'."""
     cmd = ["yt-dlp", "--no-warnings", "--js-runtimes", "node"]
     cookies = os.environ.get("YT_COOKIES", "").strip()
-    if cookies:
+    if cookies and (not free_proxy or FREE_PROXY_USE_COOKIES):
         cf = tmp / "cookies.txt"
         cf.write_text(cookies + "\n", encoding="utf-8")
         cmd += ["--cookies", str(cf)]
     method = None
     if country:
-        proxy = yt_proxy_for(country)
+        proxy = free_proxy or yt_proxy_for(country)
         if proxy:
             cmd += ["--proxy", proxy]
-            method = "proxy"
+            method = "free" if free_proxy else "proxy"
+            if free_proxy:  # proxy grátis é lento e cai: falhar rápido e passar para o próximo
+                cmd += ["--socket-timeout", "20", "--retries", "2", "--fragment-retries", "2", "--extractor-retries", "1"]
         else:
             cmd += ["--geo-bypass-country", country.upper()]
             method = "header"
@@ -1117,6 +1239,8 @@ def yt_hint(err, country, method):
     if re.search(r"sign in|not a bot|confirm you", err, re.I):
         return "\n(O YouTube bloqueou o IP do GitHub Actions. Crie o secret YT_COOKIES com um cookies.txt de uma conta logada.)"
     if GEO_RE.search(err):
+        if method == "free":
+            return f"\n(Mesmo pelos proxies grátis de '{country}' o conteúdo foi recusado: talvez eles não saiam mesmo nesse país.)"
         if not country:
             return "\n(Bloqueio regional. Tente de novo com pais=nz (ou o código do país onde o conteúdo está liberado).)"
         if method == "header":
@@ -1127,8 +1251,22 @@ def yt_hint(err, country, method):
 
 
 def yt_list(tmp, url, country):
-    cmd, method = yt_base(tmp, country)
-    p = subprocess.run(cmd + ["--no-playlist", "-F", "--", url], capture_output=True, text=True, timeout=300)
+    routes, free = yt_routes(country)
+    if not routes:
+        return
+    p, method = None, None
+    for px in routes:
+        cmd, method = yt_base(tmp, country, px)
+        try:
+            p = subprocess.run(cmd + ["--no-playlist", "-F", "--", url], capture_output=True, text=True, timeout=120 if free else 300)
+        except subprocess.TimeoutExpired:
+            p = None
+            continue
+        if p.returncode == 0 and (p.stdout or "").strip():
+            break
+    if p is None:
+        say("❌ /yt formatos: todos os proxies tentados demoraram demais.")
+        return
     out = yt_redact((p.stdout or "").strip())
     if p.returncode != 0 or not out:
         err, _ = yt_err(p)
@@ -1263,45 +1401,71 @@ def op_yt(tmp):
         say("Formato inválido. Use o ID mostrado em /yt formatos (ex.: 251 ou 137+140).")
         return
 
-    cmd, method = yt_base(tmp, country)
-    cmd += ["--ignore-errors", "--no-mtime", "-o", str(tmp / "%(playlist_index&{} - |)s%(title).120B.%(ext)s")]
+    rest = []  # argumentos do download; o comando base (proxy etc.) é montado a cada tentativa
+    rest += ["--ignore-errors", "--no-mtime", "-o", str(tmp / "%(playlist_index&{} - |)s%(title).120B.%(ext)s")]
     if items:
-        cmd += ["--yes-playlist", "--playlist-items", items]  # o playlist_index continua sendo o número real da faixa
+        rest += ["--yes-playlist", "--playlist-items", items]  # o playlist_index continua sendo o número real da faixa
     else:
-        cmd += ["--yes-playlist", "--playlist-end", str(maxn)] if playlist else ["--no-playlist"]
+        rest += ["--yes-playlist", "--playlist-end", str(maxn)] if playlist else ["--no-playlist"]
 
     if fmt == "video":
         h = int(ARGS.get("height") or 720)
         sel = fsel or f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/b[height<={h}][ext=mp4]/bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b"
-        cmd += ["-f", sel, "--merge-output-format", "mp4", "--embed-metadata"]
+        rest += ["-f", sel, "--merge-output-format", "mp4", "--embed-metadata"]
     else:
         # "ba*" aceita formato com áudio mesmo que traga vídeo junto (Twitter, TikTok...): o -x descarta o vídeo
-        cmd += ["-f", fsel or "ba*/ba/b", "-x", "--audio-format", fmt]
+        rest += ["-f", fsel or "ba*/ba/b", "-x", "--audio-format", fmt]
         if fmt in ("mp3", "m4a", "opus") and ARGS.get("bitrate"):
-            cmd += ["--audio-quality", f"{int(ARGS['bitrate'])}K"]
+            rest += ["--audio-quality", f"{int(ARGS['bitrate'])}K"]
         elif fmt == "mp3":
-            cmd += ["--audio-quality", "0"]
+            rest += ["--audio-quality", "0"]
         if album:
             # as tags e a capa são feitas depois, em Python (album_process)
-            cmd += ["--write-info-json", "--no-write-playlist-metafiles", "--write-thumbnail", "--convert-thumbnails", "jpg"]
+            rest += ["--write-info-json", "--no-write-playlist-metafiles", "--write-thumbnail", "--convert-thumbnails", "jpg"]
         else:
-            cmd += ["--embed-metadata"]
+            rest += ["--embed-metadata"]
             if fmt != "wav":
-                cmd += ["--embed-thumbnail", "--convert-thumbnails", "jpg"]
+                rest += ["--embed-thumbnail", "--convert-thumbnails", "jpg"]
 
-    cmd += ["--", url]  # "--" impede que a URL seja lida como opção
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=25 * 60)
-    except subprocess.TimeoutExpired:
-        say("❌ /yt: passou de 25 minutos e foi interrompido.")
+    rest += ["--", url]  # "--" impede que a URL seja lida como opção
+
+    routes, free = yt_routes(country)
+    if not routes:
         return
-
     exts = YT_VIDEO_EXT if fmt == "video" else YT_AUDIO_EXT
-    files = sorted((x for x in tmp.iterdir() if x.is_file() and x.suffix.lower() in exts), key=lambda x: x.stat().st_mtime)
+    deadline = time.time() + FREE_PROXY_BUDGET
+    p, method, files, tried = None, None, [], 0
+    for px in routes:
+        tried += 1
+        base, method = yt_base(tmp, country, px)
+        try:
+            p = subprocess.run(base + rest, capture_output=True, text=True, timeout=FREE_PROXY_ATTEMPT_TIMEOUT if free else 25 * 60)
+        except subprocess.TimeoutExpired:
+            p = None
+            if not free:
+                say("❌ /yt: passou de 25 minutos e foi interrompido.")
+                return
+            if time.time() > deadline:
+                break
+            continue
+        files = sorted((x for x in tmp.iterdir() if x.is_file() and x.suffix.lower() in exts), key=lambda x: x.stat().st_mtime)
+        if files or not free:
+            break
+        e, _ = yt_err(p)
+        if YT_FATAL_RE.search(e) or time.time() > deadline:
+            break
+
+    if p is None:
+        say(f"❌ /yt: {tried} proxy(ies) grátis tentado(s), todos lentos demais.")
+        return
     err, had_err = yt_err(p)
 
     if not files:
-        say(f"❌ /yt: {err}{yt_hint(err, country, method)}")
+        if free:
+            say(f"❌ /yt: nenhum dos {tried} proxy(ies) grátis de {country.upper()} conseguiu baixar. Último erro: {err}\n"
+                f"(Proxy grátis é instável: tente de novo ou configure um proxy fixo no secret YT_PROXIES.){yt_hint(err, country, method)}")
+        else:
+            say(f"❌ /yt: {err}{yt_hint(err, country, method)}")
         return
 
     ok = 0
@@ -1327,7 +1491,8 @@ def op_yt(tmp):
             else:
                 ok += send_document(f, name)
 
-    via = {"proxy": f" via proxy {country.upper()}", "header": f" (geo-bypass {country.upper()}, sem proxy)"}.get(method, "")
+    via = {"proxy": f" via proxy {country.upper()}", "free": f" via proxy grátis {country.upper()}",
+           "header": f" (geo-bypass {country.upper()}, sem proxy)"}.get(method, "")
     extra = f" ({len(files)} de uma playlist)" if playlist else ""
     warn = f"\n⚠️ Alguns itens falharam: {err}" if ok < len(files) or (playlist and had_err) else ""
     say(f"▶️ /yt {'álbum' if album else fmt}{via}: {ok}/{len(files)} arquivo(s){extra}.{warn}")
