@@ -1035,9 +1035,12 @@ def op_espectro(tmp):
 #   YT_PROXIES  -> JSON {"nz": "socks5://usuario:senha@host:porta", "us": "http://..."}
 #                  Um proxy/VPN no país é a ÚNICA forma confiável de acessar conteúdo bloqueado por região.
 #                  Sem proxy para o país pedido, o script tenta --geo-bypass-country (só engana alguns sites).
+#   YT_BRAND     -> texto da "marca" gravado nas tags (comment, encoder, description...) e no nome do arquivo.
+#   YT_BRAND_URL -> link gravado na tag "TELEGRAM URL". Opcional.
+#   Sem YT_BRAND, o modo "marca" é ignorado (vira um álbum normal, sem marca).
 
-BRAND = "The Unreleased Collection"
-BRAND_URL = "t.me/theunreleasedmusic"
+BRAND = os.environ.get("YT_BRAND", "").strip()
+BRAND_URL = os.environ.get("YT_BRAND_URL", "").strip()
 FORCE_YEAR = "2026"  # usado com "marca"; deixe "" para usar o ano real
 
 YT_AUDIO_EXT = {".mp3", ".m4a", ".flac", ".opus", ".wav", ".ogg", ".aac"}
@@ -1151,7 +1154,7 @@ def album_process(tmp, files, marca):
 
         album = (ALBUM_PREFIX_RE.sub("", info.get("playlist_title") or "").strip() or info.get("album") or "").strip()
         track = int(info.get("playlist_index") or info.get("track_number") or i + 1)
-        if marca and FORCE_YEAR:
+        if marca and BRAND and FORCE_YEAR:
             year = FORCE_YEAR
         else:
             year = str(info.get("release_year") or (info.get("release_date") or info.get("upload_date") or "")[:4] or "")
@@ -1166,12 +1169,13 @@ def album_process(tmp, files, marca):
         tags.add(TRCK(encoding=1, text=[str(track)]))
         if year:
             tags.add(TYER(encoding=1, text=[year]))
-        if marca:
+        if marca and BRAND:
             tags.add(COMM(encoding=1, lang="eng", desc="", text=[BRAND]))
             tags.add(TENC(encoding=1, text=[BRAND]))
             for d in ("description", "synopsis", "purl"):
                 tags.add(TXXX(encoding=1, desc=d, text=[BRAND]))
-            tags.add(TXXX(encoding=1, desc="TELEGRAM URL", text=[BRAND_URL]))
+            if BRAND_URL:
+                tags.add(TXXX(encoding=1, desc="TELEGRAM URL", text=[BRAND_URL]))
 
         thumb = f.parent / f"{f.stem}.jpg"
         if thumb.exists():
@@ -1183,7 +1187,7 @@ def album_process(tmp, files, marca):
             tags.add(APIC(encoding=0, mime="image/jpeg", type=3, desc="", data=src.read_bytes()))
 
         tags.save(str(f), v2_version=3)
-        name = safe(f"{track:02d} {title} [{BRAND}]" if marca else f"{track:02d} - {title}") + ".mp3"
+        name = safe(f"{track:02d} {title} [{BRAND}]" if marca and BRAND else f"{track:02d} - {title}") + ".mp3"
         new = f.with_name(name)
         f.replace(new)
         done.append((new, title, artist))
@@ -1204,6 +1208,9 @@ def op_yt(tmp):
         return
 
     marca = bool(ARGS.get("marca"))
+    if marca and not BRAND:
+        say("⚠️ Secret YT_BRAND não configurado: vou gerar o álbum sem marca.")
+        marca = False
     album = bool(ARGS.get("album")) or marca
     fmt = "mp3" if album else (ARGS.get("fmt") or "mp3")
     playlist = bool(ARGS.get("playlist")) or (album and bool(re.search(r"[?&]list=|/playlist", url)))
