@@ -32,17 +32,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Instala ffmpeg e exiftool
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg libimage-exiftool-perl
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip                                   # reaproveita os pacotes entre execuções
+          cache-dependency-path: scripts/requirements.txt
 
       - name: Instala dependências Python
-        run: pip install mutagen kurigram tgcrypto "yt-dlp[default]"
+        run: pip install -r scripts/requirements.txt
+
+      # ffmpeg estático: um download só, sem o "apt-get update" + dezenas de pacotes de antes
+      - uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          github-token: ${{ github.token }}
+
+      # exiftool só é usado no /info detalhado
+      - name: Instala exiftool (só no /info)
+        if: github.event.client_payload.op == 'info'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libimage-exiftool-perl
 
       - name: Processa o áudio
         env:
