@@ -1,0 +1,33 @@
+name: box-gofile
+on:
+  repository_dispatch:
+    types: [box-gofile]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Token (mascarado nos logs)
+        run: |
+          TOKEN=$(jq -r '.client_payload.gofile_token' "$GITHUB_EVENT_PATH")
+          echo "::add-mask::$TOKEN"
+          echo "GOFILE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Enviar
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TG_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          TG_THREAD_ID: ${{ github.event.client_payload.thread_id }}
+          BOX_URL: ${{ github.event.client_payload.url }}
+          BOX_SELECT: ${{ github.event.client_payload.select }}
+          BOX_MODE: ${{ github.event.client_payload.mode }}
+          BOX_FOLDER: ${{ github.event.client_payload.folder }}
+        run: |
+          ARGS=(--select "$BOX_SELECT" --mode "$BOX_MODE" -y)
+          [ -n "$BOX_FOLDER" ] && ARGS+=(--folder "$BOX_FOLDER")
+          python box2gofile.py "$BOX_URL" "${ARGS[@]}"
