@@ -6,7 +6,7 @@ Chamado pelo workflow audio-tools.yml (repository_dispatch, event_type "audio-to
 Payload enviado pelo Worker:
 
     op        : info | capa | limpar | renomear | tag |
-                converter | cortar | normalizar | juntar | espectro | yt
+                converter | cortar | normalizar | juntar | espectro | yt | marca
     args      : parâmetros do comando (depende do op)
     chat_id   : chat de destino
     thread_id : tópico de destino (pode ser null)
@@ -1346,6 +1346,18 @@ def yt_performers(info, artists, main):
     return [main] + others
 
 
+def add_brand(tags):
+    """Frames da marca: comentário, encoder, description/synopsis/purl e o link em "TELEGRAM URL"."""
+    from mutagen.id3 import COMM, TENC, TXXX
+
+    tags.add(COMM(encoding=1, lang="eng", desc="", text=[BRAND]))
+    tags.add(TENC(encoding=1, text=[BRAND]))
+    for d in ("description", "synopsis", "purl"):
+        tags.add(TXXX(encoding=1, desc=d, text=[BRAND]))
+    if BRAND_URL:
+        tags.add(TXXX(encoding=1, desc="TELEGRAM URL", text=[BRAND_URL]))
+
+
 def album_process(tmp, files, marca):
     """Tags no estilo do seu pipeline: info.json do yt-dlp -> ID3v2.3 via mutagen, capa quadrada, nome 'NN Título [marca].mp3'."""
     from mutagen.id3 import APIC, COMM, ID3, TALB, TENC, TIT2, TPE1, TPE2, TRCK, TXXX, TYER
@@ -1389,12 +1401,7 @@ def album_process(tmp, files, marca):
         if year:
             tags.add(TYER(encoding=1, text=[year]))
         if marca and BRAND:
-            tags.add(COMM(encoding=1, lang="eng", desc="", text=[BRAND]))
-            tags.add(TENC(encoding=1, text=[BRAND]))
-            for d in ("description", "synopsis", "purl"):
-                tags.add(TXXX(encoding=1, desc=d, text=[BRAND]))
-            if BRAND_URL:
-                tags.add(TXXX(encoding=1, desc="TELEGRAM URL", text=[BRAND_URL]))
+            add_brand(tags)
 
         thumb = f.parent / f"{f.stem}.jpg"
         if thumb.exists():
@@ -1549,6 +1556,128 @@ def op_yt(tmp):
     say(f"▶️ /yt {'álbum' if album else fmt}{via}: {ok}/{len(files)} arquivo(s){extra}.{warn}\n{tempos}")
 
 
+# ---------- /marca: a "marca" do /yt aplicada em QUALQUER áudio ----------
+# Faz com os áudios enviados o mesmo que "/yt ... marca" faz com o que baixa: tag nova e limpa (ID3v2.3),
+# ano forçado (FORCE_YEAR), marca em comentário/encoder/description/synopsis/purl, link em "TELEGRAM URL",
+# capa recortada em quadrado e nome "NN Título [marca].mp3".
+# MP3 não é reencodado (só troca a tag). FLAC, M4A, OGG, OPUS, WAV etc. viram MP3 V0, igual ao /yt.
+# Título, artista, álbum, nº da faixa e capa são lidos do próprio arquivo (ffprobe), seja qual for o formato.
+
+SQUARE_CROP = "crop=min(iw\\,ih):min(iw\\,ih):(iw-min(iw\\,ih))/2:(ih-min(iw\\,ih))/2"
+
+
+def _audio_tags(meta):
+    """Tags de qualquer formato, com chave em minúsculas (format.tags + tags do stream de áudio, onde ogg/opus guardam)."""
+    out = {}
+    sources = [(meta.get("format") or {}).get("tags") or {}]
+    sources += [x.get("tags") or {} for x in meta.get("streams", []) if x.get("codec_type") == "audio"]
+    for tg in sources:
+        for k, v in tg.items():
+            if v and str(v).strip() and k.lower() not in out:
+                out[k.lower()] = str(v).strip()
+    return out
+
+
+def marca_prepare(tmp, i, f, album_override):
+    """Baixa, converte (se preciso) e grava a tag de UM arquivo. Devolve {'path',...} ou {'error'}. Roda em thread."""
+    from mutagen.id3 import APIC, ID3, TALB, TIT2, TPE1, TPE2, TRCK, TYER
+
+    label = f.get("name") or f"faixa{i + 1}"
+    try:
+        src = get_src(tmp, i, f)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{label}: não consegui baixar: {e}"}
+    meta = probe_json(src)
+    streams = meta.get("streams", [])
+    if not any(x.get("codec_type") == "audio" for x in streams):
+        return {"error": f"{label}: não reconheci áudio nesse arquivo."}
+    tg = _audio_tags(meta)
+
+    artist = tg.get("artist") or (f.get("performer") or "").strip()
+    main = (tg.get("album_artist") or tg.get("albumartist") or artist.split(",")[0]).strip() or artist
+    title = tg.get("title") or (f.get("title") or "").strip()
+    if not title:  # sem título na tag: usa o nome do arquivo, sem o "01 - " da frente
+        title = re.sub(r"^\s*\d{1,3}\s*[.\-)_]\s*", "", stem(f.get("name"))).strip() or f"Faixa {i + 1}"
+    m = FEAT_RE.search(title)  # "(feat. X)" sai do título só se X já está no artista (igual ao /yt, que põe o feat no artista)
+    if m and artist:
+        guests = [g.strip().lower() for g in re.split(r",|&|\be\b|\bx\b", re.sub(r"(?i)^\s*[(\[]\s*feat\.?\s*|\s*[)\]]\s*$", "", m.group(0))) if g.strip()]
+        if guests and all(g in artist.lower() for g in guests):
+            title = FEAT_RE.sub("", title).strip() or title
+    album = album_override or tg.get("album") or ""
+    track = _num(tg.get("track") or tg.get("tracknumber")) or int(f.get("pos") or i + 1)
+    if BRAND and FORCE_YEAR:
+        year = FORCE_YEAR
+    else:
+        year = (re.search(r"\d{4}", tg.get("date") or tg.get("year") or "") or [""])[0]
+
+    d = tmp / f"m{i}"
+    d.mkdir()
+    sq = None
+    if any(x.get("codec_type") == "video" for x in streams):  # capa embutida (MP3/M4A/FLAC...)
+        sq = d / "capa.jpg"
+        subprocess.run(["ffmpeg", "-y", "-i", str(src), "-an", "-map", "0:v:0", "-frames:v", "1", "-vf", SQUARE_CROP,
+                        "-q:v", "2", str(sq)], capture_output=True)
+        if not sq.exists() or sq.stat().st_size < 100:
+            sq = None
+
+    mp3 = d / "audio.mp3"
+    if (meta.get("format") or {}).get("format_name") == "mp3":
+        shutil.copyfile(src, mp3)  # já é MP3: não reencoda, só troca a tag
+    else:
+        try:
+            run(["ffmpeg", "-y", "-i", str(src), "-vn", "-map", "0:a:0", "-map_metadata", "-1",
+                 "-c:a", "libmp3lame", "-q:a", "0", str(mp3)])
+        except RuntimeError as e:
+            return {"error": f"{label}: conversão para MP3 falhou: {e}"}
+
+    try:
+        tags = ID3()  # vazio: nada da tag antiga passa (equivale ao -map_metadata -1)
+        tags.add(TIT2(encoding=1, text=[title]))
+        if artist:
+            tags.add(TPE1(encoding=1, text=[artist]))
+            tags.add(TPE2(encoding=1, text=[main or artist]))
+        if album:
+            tags.add(TALB(encoding=1, text=[album]))
+        tags.add(TRCK(encoding=1, text=[str(track)]))
+        if year:
+            tags.add(TYER(encoding=1, text=[year]))
+        add_brand(tags)
+        if sq:
+            tags.add(APIC(encoding=0, mime="image/jpeg", type=3, desc="", data=sq.read_bytes()))
+        tags.save(str(mp3), v1=0, v2_version=3)  # v1=0 também tira o ID3v1 antigo, se houver
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{label}: não consegui gravar a tag: {e}"}
+
+    name = safe(f"{track:02d} {title} [{BRAND}]") + ".mp3"
+    final = d / name
+    mp3.replace(final)
+    dur = float((probe_json(final).get("format") or {}).get("duration") or 0)
+    return {"path": final, "name": name, "title": title, "artist": artist or None, "dur": dur}
+
+
+def op_marca(tmp):
+    if not BRAND:
+        say("⚠️ O secret YT_BRAND não está configurado (Settings > Secrets > Actions): sem ele não há marca para gravar.")
+        return
+    album = (ARGS.get("album") or "").strip()
+    # arquivos de até 20 MB: preparo em paralelo (download + conversão + tag). Os maiores vão por MTProto, em ordem, na vez deles.
+    pool = ThreadPoolExecutor(max_workers=3)
+    futs = {i: pool.submit(marca_prepare, tmp, i, f, album)
+            for i, f in enumerate(FILES) if 0 < int(f.get("size") or 0) <= BOT_DL_LIMIT}
+    ok = 0
+    for i, f in enumerate(FILES):
+        try:
+            r = futs[i].result() if i in futs else marca_prepare(tmp, i, f, album)
+        except Exception as e:  # noqa: BLE001
+            r = {"error": f"{f.get('name') or i + 1}: {e}"}
+        if r.get("error"):
+            say(f"❌ {r['error']}")
+            continue
+        ok += send_audio(r["path"], r["name"], r["title"], r["artist"], duration=r["dur"])
+    pool.shutdown(wait=False)
+    say(f"🏷 /marca: {ok}/{len(FILES)} arquivo(s).")
+
+
 OPS = {
     "info": op_info,
     "capa": op_capa,
@@ -1561,6 +1690,7 @@ OPS = {
     "juntar": op_juntar,
     "espectro": op_espectro,
     "yt": op_yt,
+    "marca": op_marca,
 }
 
 
