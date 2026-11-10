@@ -1,0 +1,4 @@
+mutagen
+kurigram
+tgcrypto
+yt-dlp[default]
