@@ -31,7 +31,7 @@ import random
 import tempfile
 import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape as esc
 from pathlib import Path
 from urllib import error, parse, request
@@ -865,6 +865,10 @@ def op_tag(tmp):
             say(f"⚠️ Não consegui baixar a capa nova ({e}); sigo sem ela.")
     drop_cover = ARGS.get("cover") == "remove"
     ok = 0
+    # Downloads em paralelo para os arquivos de até 20 MB (Bot API HTTP, seguro em threads). Os maiores vão por MTProto,
+    # cujo cliente é criado sob demanda e fica no laço principal, em ordem.
+    pool = ThreadPoolExecutor(max_workers=4)
+    pre = {i: pool.submit(get_src, tmp, i, f) for i, f in enumerate(FILES) if 0 < int(f.get("size") or 0) <= BOT_DL_LIMIT}
     for i, f in enumerate(FILES):
         name = f.get("out_name") or f.get("name") or f"faixa{i + 1}.mp3"
         ext = Path(f.get("name") or name).suffix.lower() or ".mp3"
@@ -873,7 +877,7 @@ def op_tag(tmp):
             say(f"❌ {name}: não sei gravar tags em {ext} (aceito: {', '.join(sorted(TAG_WRITERS))}).")
             continue
         try:
-            src = get_src(tmp, i, f)
+            src = pre[i].result() if i in pre else get_src(tmp, i, f)
             fields = f.get("fields") or {}
             writer(src, fields, set(f.get("erase") or []), cover, drop_cover)
         except Exception as e:  # noqa: BLE001
@@ -881,6 +885,7 @@ def op_tag(tmp):
             continue
         info = dict(f, title=fields.get("title") or f.get("title"), performer=fields.get("artist") or f.get("performer"))
         ok += send_any(src, name, info)
+    pool.shutdown(wait=False)
     say(f"🏷 /tag: {ok}/{len(FILES)} arquivo(s) taggeado(s).")
 
 
@@ -1100,18 +1105,18 @@ def yt_redact(text):
 # nem que ele saia mesmo no país da etiqueta. Por isso cada candidato é testado aqui antes de ser usado.
 FREE_PROXY_FALLBACK = True          # False desliga o fallback (volta ao --geo-bypass-country, que quase nunca funciona)
 FREE_PROXY_USE_COOKIES = False      # False: com proxy grátis NÃO manda o YT_COOKIES (protege a conta e evita bloqueio por IP estranho)
-FREE_PROXY_MAX_CANDIDATES = 150     # quantos candidatos testar por vez
+FREE_PROXY_MAX_CANDIDATES = 100     # quantos candidatos testar por vez (o teste para assim que FREE_PROXY_KEEP passam)
 FREE_PROXY_KEEP = 6                 # quantos proxies aprovados (os mais rápidos) tentar no download
-FREE_PROXY_PROBE_TIMEOUT = 12       # segundos por requisição de teste (proxy grátis é lento)
-FREE_PROXY_WORKERS = 40
-FREE_PROXY_ATTEMPT_TIMEOUT = 7 * 60 # tempo máximo de UMA tentativa de download com proxy grátis
-FREE_PROXY_BUDGET = 22 * 60         # depois disso não abre tentativa nova (o job do Actions morre aos 30 min)
+FREE_PROXY_PROBE_TIMEOUT = 8        # segundos por requisição de teste (proxy que demora mais que isso não serve para baixar)
+FREE_PROXY_WORKERS = 50
+FREE_PROXY_ATTEMPT_TIMEOUT = 4 * 60 # tempo máximo de UMA tentativa de download com proxy grátis (vídeo ganha o dobro)
+FREE_PROXY_BUDGET = 18 * 60         # depois disso não abre tentativa nova (o job do Actions morre aos 30 min)
 PROXY_LINE_RE = re.compile(r"^(?:(https?|socks4a?|socks5h?)://)?(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})$", re.I)
 # erros que não dependem do proxy: trocar de IP não adianta
 YT_FATAL_RE = re.compile(r"private video|has been removed|account .*terminated|members-only|join this channel|premieres in|confirm your age", re.I)
 
 
-def _fetch_text(url, timeout=15):
+def _fetch_text(url, timeout=8):
     try:
         req = request.Request(url, headers={"User-Agent": "Mozilla/5.0 (tagbot)"})
         with request.urlopen(req, timeout=timeout) as r:
@@ -1149,13 +1154,17 @@ def yt_free_candidates(country):
     for proto in ("socks5", "http", "socks4"):
         sources.append(([f"https://raw.githubusercontent.com/proxyscrape/free-proxy-list/main/proxies/countries/{cc}/{proto}/data.txt",
                          f"https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/{cc}/{proto}/data.txt"], proto, None))
-    found, seen = [], set()
-    for urls, default, conv in sources:
-        text = ""
+    def _first_text(urls):
         for u in urls:  # raw primeiro: o jsDelivr pode servir branch em cache por horas
             text = _fetch_text(u)
             if text.strip():
-                break
+                return text
+        return ""
+
+    with ThreadPoolExecutor(max_workers=len(sources)) as ex:
+        texts = list(ex.map(lambda src: _first_text(src[0]), sources))  # map mantém a ordem das fontes
+    found, seen = [], set()
+    for (urls, default, conv), text in zip(sources, texts):
         lines = conv(text) if conv else text.splitlines()
         for line in lines:
             m = PROXY_LINE_RE.match(line.strip())
@@ -1202,14 +1211,23 @@ def yt_free_proxies(country):
     cands = yt_free_candidates(country)
     if not cands:
         return [], 0, {}
-    with ThreadPoolExecutor(max_workers=FREE_PROXY_WORKERS) as ex:
-        res = list(ex.map(lambda px: _probe_proxy(px, country), cands))
-    good = sorted((t, px) for (t, _), px in zip(res, cands) if t is not None)
-    why = {}
-    for t, motivo in res:
-        if t is None:
-            why[motivo] = why.get(motivo, 0) + 1
-    return [px for _, px in good[:FREE_PROXY_KEEP]], len(cands), why
+    good, why, tested = [], {}, 0
+    ex = ThreadPoolExecutor(max_workers=FREE_PROXY_WORKERS)
+    try:
+        futs = {ex.submit(_probe_proxy, px, country): px for px in cands}
+        for fu in as_completed(futs):
+            t, motivo = fu.result()
+            tested += 1
+            if t is None:
+                why[motivo] = why.get(motivo, 0) + 1
+            else:
+                good.append((t, futs[fu]))
+                if len(good) >= FREE_PROXY_KEEP:  # já tem proxy suficiente: não espera os outros testes
+                    break
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    good.sort()
+    return [px for _, px in good], tested, why
 
 
 def yt_routes(country):
@@ -1396,6 +1414,7 @@ def album_process(tmp, files, marca):
 
 
 def op_yt(tmp):
+    t_start = time.time()
     url = (ARGS.get("url") or "").strip()
     if not re.match(r"^https?://", url):
         say("URL inválida: preciso de um link http(s).")
@@ -1426,7 +1445,8 @@ def op_yt(tmp):
         return
 
     rest = []  # argumentos do download; o comando base (proxy etc.) é montado a cada tentativa
-    rest += ["--ignore-errors", "--no-mtime", "-o", str(tmp / "%(playlist_index&{} - |)s%(title).120B.%(ext)s")]
+    rest += ["--ignore-errors", "--no-mtime", "-N", "4",  # -N: fragmentos em paralelo (só ajuda em formato fragmentado, tipo HLS/DASH)
+             "-o", str(tmp / "%(playlist_index&{} - |)s%(title).120B.%(ext)s")]
     if items:
         rest += ["--yes-playlist", "--playlist-items", items]  # o playlist_index continua sendo o número real da faixa
     else:
@@ -1457,13 +1477,16 @@ def op_yt(tmp):
     if not routes:
         return
     exts = YT_VIDEO_EXT if fmt == "video" else YT_AUDIO_EXT
+    attempt_timeout = FREE_PROXY_ATTEMPT_TIMEOUT * (2 if fmt == "video" else 1)
+    t_search = time.time() - t_start  # tempo gasto até aqui (principalmente procurando proxy)
+    t_dl0 = time.time()
     deadline = time.time() + FREE_PROXY_BUDGET
     p, method, files, tried = None, None, [], 0
     for px in routes:
         tried += 1
         base, method = yt_base(tmp, country, px)
         try:
-            p = subprocess.run(base + rest, capture_output=True, text=True, timeout=FREE_PROXY_ATTEMPT_TIMEOUT if free else 25 * 60)
+            p = subprocess.run(base + rest, capture_output=True, text=True, timeout=attempt_timeout if free else 25 * 60)
         except subprocess.TimeoutExpired:
             p = None
             if not free:
@@ -1492,6 +1515,8 @@ def op_yt(tmp):
             say(f"❌ /yt: {err}{yt_hint(err, country, method)}")
         return
 
+    t_dl = time.time() - t_dl0
+    t_up0 = time.time()
     ok = 0
     if album and fmt == "mp3":
         items = album_process(tmp, files, marca)
@@ -1519,7 +1544,9 @@ def op_yt(tmp):
            "header": f" (geo-bypass {country.upper()}, sem proxy)"}.get(method, "")
     extra = f" ({len(files)} de uma playlist)" if playlist else ""
     warn = f"\n⚠️ Alguns itens falharam: {err}" if ok < len(files) or (playlist and had_err) else ""
-    say(f"▶️ /yt {'álbum' if album else fmt}{via}: {ok}/{len(files)} arquivo(s){extra}.{warn}")
+    t_up = time.time() - t_up0
+    tempos = f"⏱ proxy/preparo {t_search:.0f}s · yt-dlp {t_dl:.0f}s · tags/envio {t_up:.0f}s"
+    say(f"▶️ /yt {'álbum' if album else fmt}{via}: {ok}/{len(files)} arquivo(s){extra}.{warn}\n{tempos}")
 
 
 OPS = {
