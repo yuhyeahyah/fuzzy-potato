@@ -6,7 +6,7 @@ Chamado pelo workflow audio-tools.yml (repository_dispatch, event_type "audio-to
 Payload enviado pelo Worker:
 
     op        : info | capa | limpar | renomear | tag |
-                converter | cortar | normalizar | juntar | espectro | yt | marca
+                converter | cortar | normalizar | juntar | espectro | bpm | yt | marca
     args      : parâmetros do comando (depende do op)
     chat_id   : chat de destino
     thread_id : tópico de destino (pode ser null)
@@ -261,8 +261,9 @@ def send_video(path, name, caption=None, duration=None, width=None, height=None)
     return r.get("ok", False)
 
 
-def send_photo(path, name, caption=None, mime="image/png"):
-    r = api("sendPhoto", {"chat_id": CHAT_ID, "message_thread_id": THREAD_ID, "caption": caption},
+def send_photo(path, name, caption=None, mime="image/png", html=False):
+    r = api("sendPhoto", {"chat_id": CHAT_ID, "message_thread_id": THREAD_ID, "caption": caption,
+                          "parse_mode": "HTML" if html else None},
             [("photo", path, name, mime)])
     if not r.get("ok"):
         say(f"❌ {name}: {r.get('description')}")
@@ -1033,6 +1034,36 @@ def op_espectro(tmp):
     say(f"🎛 /espectro: {ok}/{len(FILES)} imagem(ns).")
 
 
+def op_bpm(tmp):
+    """/bpm (simples) e /bpm complexo (mapa de andamento + gráfico). ARGS["mode"]: "simples" | "complexo"."""
+    import bpm_map  # scripts/bpm_map.py (numpy + scipy + matplotlib)
+    complexo = fold(ARGS.get("mode")) in ("complexo", "complex", "mapa")
+    ok = 0
+    for i, f in enumerate(FILES):
+        name = esc(stem(f.get("name")) or f.get("title") or f"faixa{i + 1}")
+        try:
+            src = get_src(tmp, i, f)
+            res = bpm_map.analyze(src)
+        except Exception as e:  # noqa: BLE001
+            say(f"❌ {f.get('name') or name}: {e}")
+            continue
+        report = bpm_map.report_html(res, name, simple=not complexo)
+        if complexo and res["main"]:
+            # imagem + relatório numa mensagem só (legenda de foto aceita até 1024 caracteres)
+            png = tmp / f"bpm{i}.png"
+            bpm_map.plot_png(res, png, stem(f.get("name")) or "Mapa de andamento")
+            if len(report) <= 1024:
+                if not send_photo(png, f"bpm{i}.png", caption=report, html=True):
+                    say(report, html=True)
+            else:
+                send_photo(png, f"bpm{i}.png")
+                say(report, html=True)
+        else:
+            say(report, html=True)
+        ok += 1
+    say(f"🎚 /bpm: {ok}/{len(FILES)} arquivo(s) analisado(s).")
+
+
 # ---------- /yt (yt-dlp) ----------
 # Não recebe arquivos: recebe uma URL em ARGS["url"].
 # ARGS: url, fmt (mp3|m4a|flac|opus|wav|video), bitrate, height, format_id (-f), playlist, max, items ("3-7" ou "3,4,5"),
@@ -1689,6 +1720,7 @@ OPS = {
     "normalizar": op_normalizar,
     "juntar": op_juntar,
     "espectro": op_espectro,
+    "bpm": op_bpm,
     "yt": op_yt,
     "marca": op_marca,
 }
