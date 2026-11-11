@@ -2,3 +2,6 @@ mutagen
 kurigram
 tgcrypto
 yt-dlp[default]
+numpy
+scipy
+matplotlib
