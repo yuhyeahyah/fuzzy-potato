@@ -48,15 +48,22 @@ jobs:
         with:
           github-token: ${{ github.token }}
 
-      # exiftool só é usado no /info detalhado. Se o apt falhar, o job segue sem ele
-      # (o scripts/audio_tools.py precisa tolerar a ausência do exiftool).
+      # exiftool só é usado no /info detalhado. Instalado direto do GitHub (Perl já vem no runner),
+      # sem apt: o apt-get update ficava 3 min preso nos espelhos do Ubuntu (runs #167 a #172).
+      # Se falhar, o job segue sem ele (o scripts/audio_tools.py tolera a ausência).
       - name: Instala exiftool (só no /info)
         if: github.event.client_payload.op == 'info'
         continue-on-error: true
-        timeout-minutes: 3
+        timeout-minutes: 2
         run: |
-          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15
-          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 libimage-exiftool-perl
+          set -e
+          mkdir -p "$HOME/exiftool"
+          curl -fsSL --retry 3 --max-time 60 https://github.com/exiftool/exiftool/archive/refs/tags/13.50.tar.gz -o /tmp/exiftool.tgz \
+            || curl -fsSL --retry 3 --max-time 60 https://github.com/exiftool/exiftool/archive/refs/heads/master.tar.gz -o /tmp/exiftool.tgz
+          tar -xzf /tmp/exiftool.tgz -C "$HOME/exiftool" --strip-components=1
+          printf '#!/bin/sh\nexec perl "%s/exiftool/exiftool" "$@"\n' "$HOME" | sudo tee /usr/local/bin/exiftool >/dev/null
+          sudo chmod +x /usr/local/bin/exiftool
+          exiftool -ver
 
       - name: Processa o áudio
         env:
