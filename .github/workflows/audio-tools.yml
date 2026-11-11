@@ -17,7 +17,7 @@
 #   YT_BRAND     -> (opcional, /yt marca) texto da marca gravado nas tags e no nome do arquivo.
 #   YT_BRAND_URL -> (opcional, /yt marca) link gravado na tag "TELEGRAM URL".
 #
-# No Worker: GITHUB_TOKEN (PAT classic, escopo repo) e GITHUB_REPO ("usuario/repositorio").
+# No Worker: GITHUB_TOKEN (PAT, escopo repo) e GITHUB_REPO ("usuario/repositorio").
 
 name: audio-tools
 
@@ -27,6 +27,8 @@ on:
 
 jobs:
   process:
+    # Versão fixa: o "ubuntu-latest" passou a apontar para o Ubuntu 26.04, cujos espelhos
+    # do apt falharam com "Temporary failure resolving" (runs #167, #169 e #170).
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -46,12 +48,15 @@ jobs:
         with:
           github-token: ${{ github.token }}
 
-      # exiftool só é usado no /info detalhado
+      # exiftool só é usado no /info detalhado. Se o apt falhar, o job segue sem ele
+      # (o scripts/audio_tools.py precisa tolerar a ausência do exiftool).
       - name: Instala exiftool (só no /info)
         if: github.event.client_payload.op == 'info'
+        continue-on-error: true
+        timeout-minutes: 3
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libimage-exiftool-perl
+          sudo apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 libimage-exiftool-perl
 
       - name: Processa o áudio
         env:
