@@ -132,13 +132,18 @@ def pick_quality(requested, available):
     return "best"
 
 
-def config_output(folder, downloader="ffmpeg"):
+def config_output(folder, downloader="ffmpeg", unmute=True):
     config = json.loads(VOD_SETTINGS.read_text(encoding="utf-8"))
     config["DEFAULT_DIRECTORY"] = str(folder)
     config["DEFAULT_VIDEO_FORMAT"] = ".mp4"
     config["DEFAULT_DOWNLOADER"] = downloader
     config["USE_PROGRESS_BAR"] = False
-    # vod_recovery.py consulta sempre este settings.json na sua pasta.
+    # Alguns VODs apontam para trechos "-muted" sem uma versão "-unmuted"
+    # recuperável. Nesse caso tentamos a playlist ORIGINAL, sem substituição.
+    config["UNMUTE_VIDEO"] = bool(unmute)
+    # O próprio VODRecovery trata mute; validar todos os segmentos adicionaria
+    # centenas de chamadas e não garantiria a recuperação de trechos perdidos.
+    config["CHECK_SEGMENTS"] = False
     VOD_SETTINGS.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
 
@@ -153,31 +158,45 @@ def video_probe(path):
 
 
 def download_slice(m3u8_url, quality, start, end, folder):
-    """Tenta FFmpeg e, se falhar, usa downloader alternativo do VODRecovery.
+    """Tenta o download normal e, em seguida, a playlist sem reescrever mute.
 
-    O fallback NÃO recupera segmentos que não existam mais no servidor.
-    Cada tentativa usa diretório próprio para não confundir MP4 parcial com completo.
+    O primeiro modo deixa o VODRecovery aplicar suas correções. Se ambas as
+    alternativas de download falharem, testamos o M3U8 original (que pode ter
+    áudio silenciado). Não inventa segmentos que já não existam no CDN.
     """
     folder.mkdir(parents=True, exist_ok=True)
     args = ["--m3u8", m3u8_url, "--start", hms(start), "--end", hms(end),
             "--quality", quality]
     errors = []
-    for downloader in ("ffmpeg", "yt-dlp"):
-        output = folder / downloader
+    tries = (("ffmpeg", True), ("yt-dlp", True),
+             ("ffmpeg", False), ("yt-dlp", False))
+    for idx, (downloader, unmute) in enumerate(tries):
+        mode = "tratado" if unmute else "original"
+        output = folder / f"{idx + 1:02d}_{downloader.replace('-', '')}_{mode}"
         output.mkdir(parents=True, exist_ok=True)
-        config_output(output, downloader)
+        config_output(output, downloader=downloader, unmute=unmute)
+        if idx == 1:
+            say("⚠️ FFmpeg falhou; tentando yt-dlp…")
+        elif idx == 2:
+            say("⚠️ Não foi possível baixar a playlist tratada. Testando a playlist original, preservando eventuais trechos silenciados…")
+        elif idx == 3:
+            say("⚠️ Tentando yt-dlp também na playlist original…")
         try:
             invoke_vod(args, timeout=160 * 60)
             videos = sorted(output.rglob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)
             if not videos or videos[0].stat().st_size <= 0:
-                raise RuntimeError("O programa não gerou um MP4 válido")
+                raise RuntimeError("Nenhum MP4 foi produzido")
+            duration = video_probe(videos[0])
+            if duration < 1:
+                raise RuntimeError("MP4 gerado não é reproduzível (ffprobe sem duração)")
+            if duration + 15 < end - start:
+                say(f"⚠️ Trecho obtido com apenas {hms(duration)} de {hms(end-start)} solicitados; pode ter segmentos ausentes.")
+            say(f"✅ Download concluído: método {downloader}, playlist {mode} ({hms(duration)}).")
             return videos[0]
         except Exception as exc:
-            errors.append(f"{downloader}: {str(exc)[:750]}")
-            shutil.rmtree(output, ignore_errors=True)  # remove downloads parciais antes do fallback
-            if downloader == "ffmpeg":
-                say("⚠️ Download por FFmpeg falhou; tentando novamente com yt-dlp…")
-    raise RuntimeError(" | ".join(errors))
+            errors.append(f"{downloader}/{mode}: {str(exc)[:270]}")
+            shutil.rmtree(output, ignore_errors=True)
+    raise RuntimeError("Todas as 4 tentativas falharam. " + " | ".join(errors))
 
 
 
