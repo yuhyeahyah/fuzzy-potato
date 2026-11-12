@@ -1,0 +1,76 @@
+name: twitch-tools
+
+on:
+  repository_dispatch:
+    types: [twitch-tool]
+
+permissions:
+  contents: read
+
+jobs:
+  twitch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Conferir código do repositório
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Instalar VODRecovery e dependências
+        run: |
+          git clone --depth 1 https://github.com/MacielG1/VodRecovery.git /tmp/vodrecovery
+          python -m pip install --disable-pip-version-check -r /tmp/vodrecovery/lib/requirements.txt kurigram tgcrypto
+
+      - name: Recuperar VOD e enviar ao Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          # Opcional: sessao de uma CONTA DE USUARIO Telegram Premium, nao do bot.
+          TG_PREMIUM_SESSION: ${{ secrets.TG_PREMIUM_SESSION }}
+          VODRECOVERY_SCRIPT: /tmp/vodrecovery/vod_recovery.py
+          VODRECOVERY_CONFIG: /tmp/vodrecovery/config/settings.json
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          python scripts/twitch_recovery.py
+
+      # Se a instalação falhar antes do Python iniciar, avisa no Telegram.
+      - name: Avisar falha do workflow
+        if: ${{ failure() }}
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TG_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          TG_THREAD_ID: ${{ github.event.client_payload.thread_id }}
+          GH_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          token, chat = os.getenv('BOT_TOKEN'), os.getenv('TG_CHAT_ID')
+          if not token or not chat:
+              print('Token ou chat ausente; impossível enviar aviso. Confira os secrets do repositório.')
+          else:
+              data = {
+                  'chat_id': chat,
+                  'text': '❌ /twitch: o GitHub Actions falhou. Veja o log da execução: ' + os.getenv('GH_RUN_URL', ''),
+                  'disable_web_page_preview': True,
+              }
+              if os.getenv('TG_THREAD_ID'):
+                  data['message_thread_id'] = int(os.environ['TG_THREAD_ID'])
+              req = urllib.request.Request('https://api.telegram.org/bot' + token + '/sendMessage',
+                  data=json.dumps(data).encode('utf-8'),
+                  headers={'Content-Type': 'application/json'}, method='POST')
+              try:
+                  with urllib.request.urlopen(req, timeout=25) as r:
+                      print('Notificação enviada:', r.status)
+              except Exception as e:
+                  print('Não consegui enviar notificação ao Telegram:', e)
+          PY
