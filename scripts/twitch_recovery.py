@@ -74,14 +74,33 @@ def valid_tracker_url(raw):
     return bool(re.fullmatch(r"/[A-Za-z0-9_]{1,30}/streams/\d{6,20}/?", u.path))
 
 
+def _safe_error_context(stdout, stderr):
+    """Traz a CAUSA provável, não só a última linha ('Download failed').
+
+    Nunca publica URLs temporárias de playlists no Telegram/log.
+    """
+    combined = "\n".join((stdout or "", stderr or ""))
+    # Remover URLs (podem conter assinaturas/tokens efêmeros).
+    combined = re.sub(r"https?://[^\s<>\"']+", "[URL ocultada]", combined, flags=re.I)
+    combined = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", combined)
+    lines = [x.strip()[:220] for x in combined.splitlines() if x.strip()]
+    interesting = [x for x in lines if re.search(
+        r"(?i)error|failed|forbidden|not found|denied|HTTP|403|404|410|invalid|unavailable|segment|timeout|unable|no such file",
+        x)]
+    selected = interesting[-6:] if interesting else lines[-6:]
+    if not selected:
+        return "VODRecovery falhou, mas não forneceu detalhes"
+    return " | ".join(selected)[-900:]
+
+
 def invoke_vod(args, timeout=600):
     cmd = [sys.executable, str(VOD_SCRIPT), *args]
-    # Nunca passa a URL como string de comando: nenhum shell é executado.
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    # Nunca passa o link como comando de shell.
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                       stdin=subprocess.DEVNULL, errors="replace")
     if p.returncode:
-        msg = (p.stderr or p.stdout or "VODRecovery falhou").strip()
-        lines = [s.strip() for s in msg.splitlines() if s.strip()]
-        raise RuntimeError((lines[-1] if lines else "VODRecovery falhou")[:350])
+        detail = _safe_error_context(p.stdout, p.stderr)
+        raise RuntimeError(f"VODRecovery (código {p.returncode}): {detail}")
     return p.stdout
 
 
@@ -113,11 +132,11 @@ def pick_quality(requested, available):
     return "best"
 
 
-def config_output(folder):
+def config_output(folder, downloader="ffmpeg"):
     config = json.loads(VOD_SETTINGS.read_text(encoding="utf-8"))
     config["DEFAULT_DIRECTORY"] = str(folder)
     config["DEFAULT_VIDEO_FORMAT"] = ".mp4"
-    config["DEFAULT_DOWNLOADER"] = "ffmpeg"
+    config["DEFAULT_DOWNLOADER"] = downloader
     config["USE_PROGRESS_BAR"] = False
     # vod_recovery.py consulta sempre este settings.json na sua pasta.
     VOD_SETTINGS.write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -134,15 +153,31 @@ def video_probe(path):
 
 
 def download_slice(m3u8_url, quality, start, end, folder):
+    """Tenta FFmpeg e, se falhar, usa downloader alternativo do VODRecovery.
+
+    O fallback NÃO recupera segmentos que não existam mais no servidor.
+    Cada tentativa usa diretório próprio para não confundir MP4 parcial com completo.
+    """
     folder.mkdir(parents=True, exist_ok=True)
-    config_output(folder)
     args = ["--m3u8", m3u8_url, "--start", hms(start), "--end", hms(end),
             "--quality", quality]
-    invoke_vod(args, timeout=180 * 60)  # VOD inteiro pode ser grande
-    videos = sorted(folder.glob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)
-    if not videos or not videos[0].stat().st_size:
-        raise RuntimeError("VODRecovery finalizou, mas não gerou um MP4.")
-    return videos[0]
+    errors = []
+    for downloader in ("ffmpeg", "yt-dlp"):
+        output = folder / downloader
+        output.mkdir(parents=True, exist_ok=True)
+        config_output(output, downloader)
+        try:
+            invoke_vod(args, timeout=160 * 60)
+            videos = sorted(output.rglob("*.mp4"), key=lambda f: f.stat().st_mtime, reverse=True)
+            if not videos or videos[0].stat().st_size <= 0:
+                raise RuntimeError("O programa não gerou um MP4 válido")
+            return videos[0]
+        except Exception as exc:
+            errors.append(f"{downloader}: {str(exc)[:750]}")
+            shutil.rmtree(output, ignore_errors=True)  # remove downloads parciais antes do fallback
+            if downloader == "ffmpeg":
+                say("⚠️ Download por FFmpeg falhou; tentando novamente com yt-dlp…")
+    raise RuntimeError(" | ".join(errors))
 
 
 
@@ -455,7 +490,7 @@ def main():
                 total_sent += deliver(path, caption, premium_client, limit)
             except Exception as exc:
                 failures.append(i + 1)
-                say(f"❌ Twitch: periodo {i + 1}/{chunks} falhou: {str(exc)[:350]}")
+                say(f"❌ Twitch: periodo {i + 1}/{chunks} falhou: {str(exc)[:1200]}")
             finally:
                 shutil.rmtree(folder, ignore_errors=True)
     say(f"{'✅' if not failures else '⚠️'} /twitch: {total_sent} arquivo(s) enviados. "
