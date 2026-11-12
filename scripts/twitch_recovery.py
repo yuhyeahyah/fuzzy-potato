@@ -196,6 +196,9 @@ def download_slice(m3u8_url, quality, start, end, folder):
         except Exception as exc:
             errors.append(f"{downloader}/{mode}: {str(exc)[:270]}")
             shutil.rmtree(output, ignore_errors=True)
+            if re.search(r"code -11\b|Segmentation fault|SIGSEGV", str(exc)):
+                raise RuntimeError("ffmpeg do runner deu segfault (SIGSEGV): o binário está quebrado, "
+                                   "não é problema do VOD. " + errors[-1]) from exc
     raise RuntimeError("Todas as 4 tentativas falharam. " + " | ".join(errors))
 
 
