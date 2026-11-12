@@ -16,6 +16,9 @@
 #                   Proxy/VPN que sai no país escolhido: é o que realmente contorna bloqueio regional.
 #   YT_BRAND     -> (opcional, /yt marca) texto da marca gravado nas tags e no nome do arquivo.
 #   YT_BRAND_URL -> (opcional, /yt marca) link gravado na tag "TELEGRAM URL".
+#   ACOUSTID_KEY -> (/identificar) chave de aplicação do AcoustID: https://acoustid.org/new-application
+# Variável (Settings > Variables, opcional): MB_USER_AGENT -> "NomeDoBot/1.0 ( seu@email )".
+#   Sem ela o script usa o link do repositório como contato, que o MusicBrainz aceita.
 #
 # No Worker: GITHUB_TOKEN (PAT, escopo repo) e GITHUB_REPO ("usuario/repositorio").
 
@@ -65,6 +68,29 @@ jobs:
           sudo chmod +x /usr/local/bin/exiftool
           exiftool -ver
 
+      # Chromaprint (fpcalc) estático do release oficial; apt só como plano B.
+      # continue-on-error: se falhar, o script avisa o painel do /tag2 em vez de deixar ele preso.
+      - name: Instala fpcalc (só no /identificar)
+        if: github.event.client_payload.op == 'identificar'
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          V=1.5.1
+          if curl -fsSL --retry 3 --max-time 60 "https://github.com/acoustid/chromaprint/releases/download/v$V/chromaprint-fpcalc-$V-linux-x86_64.tar.gz" -o /tmp/fpcalc.tgz \
+             && tar -xzf /tmp/fpcalc.tgz -C /tmp; then
+            sudo install -m 755 "/tmp/chromaprint-fpcalc-$V-linux-x86_64/fpcalc" /usr/local/bin/fpcalc
+          else
+            sudo apt-get install -y --no-install-recommends libchromaprint-tools
+          fi
+          fpcalc -version
+
+      # o token de retorno do /identificar vai no payload: some dos logs
+      - name: Mascara o token de retorno
+        if: github.event.client_payload.callback.token != ''
+        run: |
+          T=$(jq -r '.client_payload.callback.token // empty' "$GITHUB_EVENT_PATH")
+          if [ -n "$T" ]; then echo "::add-mask::$T"; fi
+
       - name: Processa o áudio
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
@@ -74,5 +100,7 @@ jobs:
           YT_PROXIES: ${{ secrets.YT_PROXIES }}
           YT_BRAND: ${{ secrets.YT_BRAND }}
           YT_BRAND_URL: ${{ secrets.YT_BRAND_URL }}
+          ACOUSTID_KEY: ${{ secrets.ACOUSTID_KEY }}
+          MB_USER_AGENT: ${{ vars.MB_USER_AGENT }}
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: python scripts/audio_tools.py
