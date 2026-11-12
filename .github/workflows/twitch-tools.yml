@@ -19,10 +19,28 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Instalar FFmpeg
-        uses: FedericoCarboni/setup-ffmpeg@v3
-        with:
-          github-token: ${{ github.token }}
+      - name: Instalar FFmpeg (glibc dinâmica, resolve DNS)
+        timeout-minutes: 5
+        run: |
+          set -e
+          URL=https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          if curl -fsSL --retry 3 --max-time 120 "$URL" -o /tmp/ff.tar.xz; then
+            mkdir -p /tmp/ff
+            tar -xJf /tmp/ff.tar.xz -C /tmp/ff --strip-components=1
+            sudo install -m 755 /tmp/ff/bin/ffmpeg /tmp/ff/bin/ffprobe /usr/local/bin/
+          else
+            sudo apt-get -o Acquire::Retries=3 update
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
+          hash -r
+          which ffmpeg && ffmpeg -hide_banner -version | head -1
+          # Teste de rede: um ffmpeg quebrado dá segfault (139) ao resolver DNS
+          set +e
+          ffprobe -v error -i https://github.com/ >/dev/null 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 139 ]; then echo "::error::ffprobe segfault em HTTPS"; exit 1; fi
+          echo "ffprobe HTTPS ok (rc=$rc; erro de formato é esperado, segfault não)"
 
       - name: Instalar VODRecovery e dependências
         run: |
