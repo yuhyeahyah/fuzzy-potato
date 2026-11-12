@@ -6,12 +6,13 @@ Chamado pelo workflow audio-tools.yml (repository_dispatch, event_type "audio-to
 Payload enviado pelo Worker:
 
     op        : info | capa | limpar | renomear | tag |
-                converter | cortar | normalizar | juntar | espectro | bpm | yt | marca
+                converter | cortar | normalizar | juntar | espectro | bpm | yt | marca | identificar
     args      : parâmetros do comando (depende do op)
     chat_id   : chat de destino
     thread_id : tópico de destino (pode ser null)
     files     : [{ file_id, name, title, performer, duration, size, mime, pos,
-                   fields, out_name, erase }]
+                   fields, out_name, erase, message_id }]
+    callback  : (só /identificar dentro do /tag2) { url, token }: o resultado volta para o Worker
 
 SOBRE O LIMITE DE 20 MB
     O teto de 20 MB NÃO é do Cloudflare Worker: é da própria Bot API (getFile).
@@ -1709,6 +1710,213 @@ def op_marca(tmp):
     say(f"🏷 /marca: {ok}/{len(FILES)} arquivo(s).")
 
 
+# ---------- /identificar (Chromaprint + AcoustID + MusicBrainz) ----------
+# A lógica fica em scripts/fpid.py; aqui só a parte de Telegram.
+# Com PAYLOAD["callback"] (veio do painel do /tag2): manda o resultado para o Worker, que grava na sessão.
+# Sem callback (/identificar solto): responde um relatório no chat.
+# Secret: ACOUSTID_KEY (https://acoustid.org/new-application). Opcional: MB_USER_AGENT.
+
+class Progress:
+    """Uma mensagem de status editada no lugar (no máximo a cada 3 s, pra não bater no limite)."""
+
+    def __init__(self, text):
+        r = api("sendMessage", {"chat_id": CHAT_ID, "message_thread_id": THREAD_ID, "text": text,
+                                "disable_notification": "true"})
+        self.mid = r["result"]["message_id"] if r.get("ok") else None
+        self.text, self.last = text, time.monotonic()
+
+    def update(self, text, force=False):
+        if not self.mid or text == self.text:
+            return
+        if not force and time.monotonic() - self.last < 3:
+            return
+        self.text, self.last = text, time.monotonic()
+        api("editMessageText", {"chat_id": CHAT_ID, "message_id": self.mid, "text": text})
+
+    def done(self):
+        if self.mid:
+            api("deleteMessage", {"chat_id": CHAT_ID, "message_id": self.mid})
+            self.mid = None
+
+
+def _fp_cover_upload(path, mime, caption=None, keep=False):
+    """Sobe a capa como foto. keep=False: apaga em seguida e só devolve os file_id (capa da sessão /tag2)."""
+    r = api("sendPhoto", {"chat_id": CHAT_ID, "message_thread_id": THREAD_ID, "caption": caption,
+                          "parse_mode": "HTML" if caption else None,
+                          "disable_notification": None if keep else "true"},
+            [("photo", path, path.name, mime)])
+    if not r.get("ok"):
+        return None
+    res = r["result"]
+    photos = res.get("photo") or []
+    if not keep:
+        api("deleteMessage", {"chat_id": CHAT_ID, "message_id": res["message_id"]})
+    if not photos:
+        return None
+    small = [p for p in photos if max(p["width"], p["height"]) <= 320]
+    return {"full": photos[-1]["file_id"], "thumb": (small[-1] if small else photos[0])["file_id"]}
+
+
+def _fp_cover_file(tmp, data, mime):
+    """Grava a capa; acima de 4 MB reduz para 1500 px (o sendPhoto aceita até 10 MB, mas não vale o peso)."""
+    path = tmp / ("capa.png" if mime == "image/png" else "capa.jpg")
+    path.write_bytes(data)
+    if len(data) > 4 * 1024 * 1024:
+        small = tmp / "capa_small.jpg"
+        p = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(path), "-vf",
+                            "scale='min(1500,iw)':-2", "-q:v", "3", str(small)], capture_output=True, text=True)
+        if p.returncode == 0 and small.exists():
+            return small, "image/jpeg"
+    return path, mime
+
+
+FP_ICON = {"album": "✅", "fuzzy": "🔶", "single": "🎯", "none": "❓", "error": "❌"}
+
+
+def _fp_report(release, results, warn):
+    n = len(results)
+    ok = sum(1 for r in results if r["status"] in ("album", "fuzzy", "single"))
+    lines = ["<b>🧬 Identificação</b>"]
+    if release:
+        meta = " · ".join(x for x in (release["year"], release["label"], release["genre"]) if x)
+        lines.append(f'📀 <a href="https://musicbrainz.org/release/{release["id"]}"><b>{esc(release["title"])}</b></a>'
+                     f' · {esc(release["artist"])}' + (f"\n{esc(meta)}" if meta else ""))
+        ed = " · ".join(x for x in (release["country"], release["format"], f'{release["track_total"]} faixas') if x)
+        lines.append(f"<i>Edição: {esc(ed)}</i>")
+    elif ok:
+        lines.append("<i>Sem consenso de álbum: cada faixa foi identificada sozinha.</i>")
+    lines.append(f"{ok}/{n} identificada(s)\n")
+    order = sorted(range(n), key=lambda i: (results[i]["status"] not in ("album", "fuzzy"),
+                                            results[i]["disc"] or 1, results[i]["position"] or 0, i))
+    for i in order:
+        r, f = results[i], FILES[i]
+        name = stem(f.get("name")) or f.get("title") or f"faixa {i + 1}"
+        pos = (f'{r["disc"]}-' if release and release["disc_total"] > 1 and r["disc"] else "") + (str(r["position"]) if r["position"] else "")
+        if r["status"] in ("album", "fuzzy", "single"):
+            who = f' · {esc(r["credit"])}' if r["credit"] and (not release or r["credit"] != release["artist"]) else ""
+            lines.append(f'{FP_ICON[r["status"]]} {pos + ". " if pos else ""}{esc(r["title"])}{who} '
+                         f'<i>({round(r["score"] * 100)}%)</i>' + (f"\n    ↳ {esc(name)}" if fold(name) != fold(r["title"]) else ""))
+        else:
+            lines.append(f'{FP_ICON["error" if r["error"] else "none"]} {esc(name)}' + (f' <i>({esc(r["error"])})</i>' if r["error"] else ""))
+    if warn:
+        lines.append(f"\n⚠️ {esc(warn)}")
+    lines.append("\n✅ mesma gravação · 🔶 casada por título + duração · 🎯 identificada fora do álbum · ❓ sem resultado")
+    return "\n".join(lines)
+
+
+def op_identificar(tmp):
+    import fpid  # scripts/fpid.py
+
+    cb = PAYLOAD.get("callback") if isinstance(PAYLOAD.get("callback"), dict) else None
+    key = os.environ.get("ACOUSTID_KEY", "").strip()
+
+    def finish_error(msg):
+        # no modo /tag2 o Worker precisa saber, senão o painel fica marcado como "identificando"
+        if not (cb and fpid.post_callback(cb, {"ok": False, "error": msg})):
+            say(f"❌ /identificar: {msg}")
+
+    if not key:
+        return finish_error("falta o secret ACOUSTID_KEY no repositório (crie a chave em https://acoustid.org/new-application)")
+    if not fpid.fpcalc_bin():
+        return finish_error("o fpcalc (Chromaprint) não foi instalado no runner; veja o passo 'Instala fpcalc' do workflow")
+
+    n = len(FILES)
+    prog = Progress(f"🧬 Identificando {n} faixa(s)… baixando e analisando 0/{n}")
+    fps = [None] * n
+
+    def work(i):
+        f, src = FILES[i], None
+        try:
+            src = get_src(tmp, i, f)
+            dur, fp = fpid.fingerprint(src)
+            return i, {"duration": dur, "fp": fp}
+        except Exception as e:  # noqa: BLE001
+            return i, {"error": str(e)[:200]}
+        finally:
+            if src:
+                Path(src).unlink(missing_ok=True)  # não acumula 60 arquivos no disco do runner
+
+    try:
+        big = [i for i, f in enumerate(FILES) if (f.get("size") or 0) > BOT_DL_LIMIT]
+        small = [i for i in range(n) if i not in big]
+        done = 0
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for fut in as_completed([pool.submit(work, i) for i in small]):
+                i, r = fut.result()
+                fps[i], done = r, done + 1
+                prog.update(f"🧬 Identificando {n} faixa(s)… baixando e analisando {done}/{n}")
+        for i in big:  # MTProto (acima de 20 MB): um por vez, o cliente não é thread-safe
+            _, fps[i] = work(i)
+            done += 1
+            prog.update(f"🧬 Identificando {n} faixa(s)… baixando e analisando {done}/{n}")
+
+        tracks = []
+        for i, f in enumerate(FILES):
+            r = fps[i] or {"error": "não processado"}
+            t = {"duration": r.get("duration") or f.get("duration") or 0, "cands": [],
+                 "error": r.get("error") or "", "names": fpid.names_for(f)}
+            if r.get("fp"):
+                try:
+                    t["cands"] = fpid.lookup(key, r["fp"], t["duration"])
+                except fpid.FatalError as e:
+                    prog.done()
+                    return finish_error(str(e))
+                except Exception as e:  # noqa: BLE001
+                    t["error"] = str(e)[:200]
+            tracks.append(t)
+            prog.update(f"🧬 Consultando o AcoustID… {i + 1}/{n}")
+
+        prog.update("🧬 Escolhendo a edição no MusicBrainz…", force=True)
+        best, release, warn = fpid.choose_release(tracks), None, ""
+        if best:
+            try:
+                release = fpid.mb_release(best["rel"]["id"])
+            except Exception as e:  # noqa: BLE001
+                warn = f"o MusicBrainz falhou ({e}); usei só os dados do AcoustID"
+        results = fpid.build_results(tracks, release)
+
+        cover_ids, cover_src, cover_path = None, "", None
+        if release:
+            prog.update("🧬 Procurando a capa…", force=True)
+            got = fpid.find_cover(release)
+            if got:
+                data, mime, cover_src = got
+                cover_path, mime = _fp_cover_file(tmp, data, mime)
+                if cb:
+                    cover_ids = _fp_cover_upload(cover_path, mime)
+    finally:
+        prog.done()
+
+    if cb:
+        body = {
+            "ok": True,
+            "release": fpid.release_public(release),
+            "cover": cover_ids,
+            "cover_source": cover_src,
+            "warning": warn,
+            "tracks": [{**r, "message_id": FILES[i].get("message_id")} for i, r in enumerate(results)],
+        }
+        if fpid.post_callback(cb, body):
+            return
+        warn = (warn + " · " if warn else "") + "não consegui entregar o resultado ao painel do /tag2; nada foi gravado"
+
+    report = _fp_report(release, results, warn)
+    if cover_path and release and not cb:
+        cap = f'📀 <b>{esc(release["title"])}</b> · {esc(release["artist"])}' + (f" · {release['year']}" if release["year"] else "")
+        _fp_cover_upload(cover_path, "image/png" if cover_path.suffix == ".png" else "image/jpeg", caption=cap[:1000], keep=True)
+    if not cb:
+        report += "\n\n<i>Para gravar isso nas tags: abra /tag2, mande os áudios e toque em 🧬 Identificar.</i>"
+    # quebra por linha (nunca no meio de uma tag HTML): o say() corta em 4000 e quebraria o parse_mode
+    chunk = ""
+    for line in report.split("\n"):
+        if len(chunk) + len(line) + 1 > 3900:
+            say(chunk, html=True)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        say(chunk, html=True)
+
+
 OPS = {
     "info": op_info,
     "capa": op_capa,
@@ -1723,6 +1931,7 @@ OPS = {
     "bpm": op_bpm,
     "yt": op_yt,
     "marca": op_marca,
+    "identificar": op_identificar,
 }
 
 
