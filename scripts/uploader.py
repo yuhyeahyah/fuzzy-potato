@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-/uploader — resolve, baixa, re-hospeda ou envia pro Telegram (com split ZIP).
+/uploader — resolve, baixa, re-hospeda, descompacta, junta partes ou envia pro Telegram (com split ZIP).
 
-Modos (client_payload):
-  mode: "telegram" (padrão) | "link" | "upload" | "unzip"
-  host: gofile | viking | pixeldrain | buzz | filebin   (para upload/unzip)
-  url:  link a resolver/baixar
-  file_id / file_name: opcional, se o usuário mandou/respondeu um arquivo
+client_payload:
+  chat_id, thread_id
+  mode : "telegram" (padrão) | "link" | "upload" | "unzip" | "join"
+  host : gofile | viking | pixeldrain | buzz | filebin | telegram   (destino de upload/unzip/join)
+  items: [ {"url", "select"?} | {"file_id", "name", "size"} ... ]
+         select = chaves marcadas nos botões (null/ausente = todos os arquivos do link)
+  opts : {"pick": true} -> se o link tiver vários arquivos, manda a lista ao Worker (botões) e encerra
+  cb   : {"url", "token"} -> endpoint /upl do Worker que recebe a lista
+  (formato antigo ainda aceito: url, file_id, file_name)
 
-Secrets necessários (mesmo dos outros workflows):
-  BOT_TOKEN, TG_API_ID, TG_API_HASH
-  TG_PREMIUM_SESSION (opcional, para ~4 GB)
+Secrets: BOT_TOKEN, TG_API_ID, TG_API_HASH, TG_PREMIUM_SESSION (opcional, ~4 GB)
 """
 import base64
+import hashlib
 import io
 import json
 import math
@@ -22,6 +25,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 import zipfile
 from html import escape as esc, unescape
 from pathlib import Path
@@ -204,6 +209,10 @@ class ZipVolumeWriter:
             offset += n
             remaining -= n
         return len(data)
+
+    def flush(self):
+        if self.current:
+            self.current.flush()
 
     def close(self):
         if self.current:
@@ -554,10 +563,32 @@ def resolve(url: str) -> dict:
     return {"url": url, "name": None, "note": "não resolvido (usando o link original)"}
 
 
-def download_to(url, dest: Path, name_hint=None):
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    say("⬇️ Baixando…")
-    with requests.get(url, headers=UA, stream=True, timeout=120) as r:
+# ---------------------------------------------------------------------------
+# Utilidades de arquivo
+# ---------------------------------------------------------------------------
+def safe_name(s, default="arquivo"):
+    s = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(s or "")).strip().strip(".")
+    return (s or default)[:150]
+
+
+def unique_path(folder: Path, name: str) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    p = folder / safe_name(name)
+    if not p.exists():
+        return p
+    n = 1
+    while True:
+        q = folder / f"{p.stem} ({n}){p.suffix}"
+        if not q.exists():
+            return q
+        n += 1
+
+
+def download_to(url, dest: Path, name_hint=None, headers=None):
+    dest.mkdir(parents=True, exist_ok=True)
+    h = dict(UA)
+    h.update(headers or {})
+    with requests.get(url, headers=h, stream=True, timeout=120) as r:
         r.raise_for_status()
         # nome a partir do Content-Disposition se não tiver
         if not name_hint:
@@ -565,7 +596,11 @@ def download_to(url, dest: Path, name_hint=None):
             m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', cd)
             if m:
                 name_hint = unquote(m.group(1)).replace('"', "")
-        final = dest / (name_hint or Path(urlparse(url).path).name or "arquivo")
+        name = name_hint or unquote(Path(urlparse(r.url or url).path).name) or "arquivo"
+        ct = (r.headers.get("content-type") or "").lower()
+        if ct.startswith("text/html") and not name.lower().endswith((".html", ".htm")):
+            raise RuntimeError("o link não é um download direto (o site devolveu uma página HTML)")
+        final = unique_path(dest, name)
         with final.open("wb") as f:
             for chunk in r.iter_content(1024 * 1024):
                 if chunk:
@@ -573,23 +608,297 @@ def download_to(url, dest: Path, name_hint=None):
     return final
 
 
+def tg_download(file_id, dest: Path, name=None):
+    target = unique_path(dest, name or "arquivo")
+    got = bot_client().download_media(file_id, file_name=str(target))
+    if not got:
+        raise RuntimeError("download do Telegram falhou")
+    return Path(got)
+
+
+def say_long(lines, limit=3800):
+    buf = ""
+    for ln in lines:
+        ln = str(ln)
+        if len(ln) > limit:
+            ln = ln[: limit - 1] + "…"
+        if buf and len(buf) + 1 + len(ln) > limit:
+            say(buf)
+            buf = ln
+        else:
+            buf = f"{buf}\n{ln}" if buf else ln
+    if buf:
+        say(buf)
+
+
+# ---------------------------------------------------------------------------
+# Expansão de links (um link pode virar vários arquivos: pastas)
+#   expand(url) -> {"title", "entries": [{key,name,size,path,url,headers}], "warn", "note"}
+# ---------------------------------------------------------------------------
+PICK_MAX = 40  # quantos itens vão para os botões (igual ao UP_MAX_BUTTONS do Worker)
+
+
+def _post(url, **kw):
+    kw.setdefault("headers", UA)
+    kw.setdefault("timeout", 25)
+    r = requests.post(url, **kw)
+    r.raise_for_status()
+    return r
+
+
+def _finalize(entries):
+    """Nome, pasta e chave única; ordem estável (a mesma nas duas execuções)."""
+    out, seen = [], {}
+    for e in entries:
+        if not e.get("url"):
+            continue
+        e["name"] = e.get("name") or unquote(Path(urlparse(e["url"]).path).name) or "arquivo"
+        e["path"] = e.get("path") or ""
+        e["size"] = e.get("size") or 0
+        out.append(e)
+    out.sort(key=lambda e: (e["path"].lower(), e["name"].lower()))
+    for e in out:
+        key = (e["path"] + "/" if e["path"] else "") + e["name"]
+        seen[key] = seen.get(key, 0) + 1
+        e["key"] = key if seen[key] == 1 else f"{key}#{seen[key]}"
+    return out
+
+
+def gofile_expand(url: str) -> dict:
+    """Pasta ou arquivo do GoFile (mesma lógica do FileHost Toolkit: token de conta + X-Website-Token)."""
+    pw = ""
+    if "::" in url:
+        parts = url.split("::")
+        pw = hashlib.sha256(parts[-1].encode()).hexdigest()
+        url = parts[-2]
+    root = url.split("?")[0].rstrip("/").split("/")[-1]
+    ua = UA["User-Agent"]
+    tk = _post("https://api.gofile.io/accounts", headers={"User-Agent": ua}).json()
+    if tk.get("status") != "ok":
+        raise RuntimeError("GoFile: sem token")
+    token = tk["data"]["token"]
+    salt = "12af056dacea0b"
+    try:
+        js = _get("https://gofile.io/js/wt.obf.js").text
+        js = re.sub(r"\\x([0-9a-f]{2})", lambda m: chr(int(m.group(1), 16)), js)
+        i = js.find("generateWT")
+        m = re.search(r"'([0-9a-f]{14})'", js[i:]) if i >= 0 else None
+        if m:
+            salt = m.group(1)
+    except Exception:
+        pass
+    wt = hashlib.sha256(f"{ua}::en-US::{token}::{int(time.time() / 14400)}::{salt}".encode()).hexdigest()
+    hdr = {"User-Agent": ua, "Authorization": f"Bearer {token}", "X-Website-Token": wt, "X-BL": "en-US"}
+    cookie = {"Cookie": f"accountToken={token}"}
+    entries, title = [], [""]
+
+    def walk(cid, path, depth=0):
+        j = _get(f"https://api.gofile.io/contents/{cid}?cache=true" + (f"&password={pw}" if pw else ""),
+                 headers=hdr).json()
+        if j.get("status") != "ok":
+            raise RuntimeError(f"GoFile: {j.get('status')}")
+        d = j.get("data") or {}
+        if depth == 0:
+            title[0] = d.get("name") or ""
+        ch = d.get("children")
+        if ch is None:  # o id é de um arquivo
+            entries.append({"url": d.get("link"), "name": d.get("name"), "size": d.get("size"),
+                            "path": path, "headers": cookie})
+            return
+        for c in ch.values():
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "folder":
+                if c.get("public") is not False and depth < 5:
+                    walk(c.get("id"), (path + "/" if path else "") + (c.get("name") or ""), depth + 1)
+            else:
+                entries.append({"url": c.get("link"), "name": c.get("name"), "size": c.get("size"),
+                                "path": path, "headers": cookie})
+
+    walk(root, "")
+    ents = _finalize(entries)
+    if not ents:
+        raise RuntimeError("GoFile: nenhum arquivo encontrado (pasta vazia, privada ou com senha)")
+    return {"title": title[0], "entries": ents, "warn": "", "note": "GoFile"}
+
+
+def pixeldrain_list(url: str) -> dict:
+    m = re.search(r"/l/([A-Za-z0-9]+)", url)
+    if not m:
+        raise RuntimeError("link de lista do PixelDrain inválido")
+    j = _get(f"https://pixeldrain.com/api/list/{m.group(1)}").json()
+    entries = [{"url": f"https://pixeldrain.com/api/file/{f['id']}?download", "name": f.get("name"),
+                "size": f.get("size")} for f in (j.get("files") or []) if f.get("id")]
+    ents = _finalize(entries)
+    if not ents:
+        raise RuntimeError("PixelDrain: lista vazia")
+    return {"title": j.get("title") or "", "entries": ents, "warn": "", "note": "PixelDrain (lista)"}
+
+
+def onedrive_expand(url: str) -> dict:
+    """Link público do OneDrive pessoal (1drv.ms / onedrive.live.com) pela API de shares.
+    Lista os arquivos do primeiro nível; subpastas não são abertas."""
+    enc = "u!" + base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+    base = f"https://api.onedrive.com/v1.0/shares/{enc}"
+    hdr = {**UA, "Accept": "application/json"}
+    j = _get(base + "/root?expand=children", headers=hdr).json()
+    entries, folders, nolink = [], 0, 0
+
+    def add(c):
+        nonlocal nolink
+        dl = c.get("@content.downloadUrl")
+        if not dl:
+            nolink += 1
+            return
+        entries.append({"url": dl, "name": c.get("name"), "size": c.get("size")})
+
+    if "folder" in j or "children" in j:
+        children = list(j.get("children") or [])
+        nxt = j.get("children@odata.nextLink")
+        for _ in range(20):
+            if not nxt:
+                break
+            page = _get(nxt, headers=hdr).json()
+            children += page.get("value") or []
+            nxt = page.get("@odata.nextLink")
+        for c in children:
+            if "folder" in c:
+                folders += 1
+            else:
+                add(c)
+    else:
+        add(j)
+    ents = _finalize(entries)
+    if not ents:
+        raise RuntimeError("OneDrive: nenhum arquivo com link direto (link privado/empresarial?)")
+    warn = []
+    if folders:
+        warn.append(f"{folders} subpasta(s) não foram abertas")
+    if nolink:
+        warn.append(f"{nolink} arquivo(s) sem link direto")
+    return {"title": j.get("name") or "", "entries": ents, "warn": "; ".join(warn), "note": "OneDrive"}
+
+
+def expand(url: str) -> dict:
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().replace("www.", "")
+    warn = ""
+    try:
+        if "gofile.io" in host and "/d/" in parsed.path:
+            return gofile_expand(url)
+        if host.endswith(("pixeldrain.com", "pixeldrain.net", "pixeldrain.dev", "pixeldra.in")) and "/l/" in parsed.path:
+            return pixeldrain_list(url)
+        if host.endswith(("onedrive.live.com", "1drv.ms")):
+            return onedrive_expand(url)
+    except Exception as e:  # cai no resolve() simples
+        print("expand falhou:", e, file=sys.stderr)
+        warn = f"não consegui listar o conteúdo ({e})"
+    r = resolve(url)
+    ents = _finalize([{"url": r["url"], "name": r.get("name"), "size": 0}])
+    return {"title": host, "entries": ents, "warn": warn, "note": r.get("note") or ""}
+
+
+def post_picker(cb, ex) -> bool:
+    """Entrega a lista de arquivos ao Worker (que mostra os botões). True se entregou."""
+    url, token = (cb or {}).get("url"), (cb or {}).get("token")
+    if not url or not token:
+        return False
+    ents = ex["entries"]
+    body = {
+        "token": token, "ok": True, "title": ex.get("title") or "", "total": len(ents),
+        "warn": ex.get("warn") or "",
+        "items": [{"key": e["key"], "name": e["name"], "size": e.get("size") or 0, "path": e.get("path") or ""}
+                  for e in ents[:PICK_MAX]],
+    }
+    data = json.dumps(body, ensure_ascii=False).encode()
+    for wait in (0, 3, 8, 15, 30, 45):
+        if wait:
+            time.sleep(wait)
+        try:
+            r = requests.post(url, data=data, timeout=30,
+                              headers={"Content-Type": "application/json", "User-Agent": "uploader-actions/1.0"})
+            if r.status_code == 200 or r.status_code == 410:  # 410: já entregue numa tentativa cuja resposta se perdeu
+                return True
+            if r.status_code in (400, 413):
+                return False
+            # 404: o token ainda não propagou no KV; 5xx: Worker instável -> tenta de novo
+        except Exception:
+            pass
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Uploaders
 # ---------------------------------------------------------------------------
+class _MultipartFile:
+    """Corpo multipart/form-data em streaming: o arquivo não é carregado na memória."""
+
+    def __init__(self, path: Path, field="file", fields=None):
+        b = self.boundary = uuid.uuid4().hex
+        fname = path.name.replace('"', "_").replace("\r", " ").replace("\n", " ")
+        pre = b""
+        for k, v in (fields or {}).items():
+            pre += f'--{b}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+        pre += (f'--{b}\r\nContent-Disposition: form-data; name="{field}"; filename="{fname}"\r\n'
+                "Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
+        post = f"\r\n--{b}--\r\n".encode()
+        self._parts = [io.BytesIO(pre), path.open("rb"), io.BytesIO(post)]
+        self._len = len(pre) + path.stat().st_size + len(post)
+
+    @property
+    def content_type(self):
+        return f"multipart/form-data; boundary={self.boundary}"
+
+    def __len__(self):
+        return self._len
+
+    def read(self, n=-1):
+        out = bytearray()
+        while self._parts and (n < 0 or len(out) < n):
+            chunk = self._parts[0].read(-1 if n < 0 else n - len(out))
+            if not chunk:
+                self._parts.pop(0).close()
+                continue
+            out += chunk
+        return bytes(out)
+
+    def close(self):
+        for p in self._parts:
+            p.close()
+        self._parts = []
+
+
+def _post_multipart(url, path: Path, fields=None):
+    body = _MultipartFile(path, "file", fields)
+    try:
+        return requests.post(url, data=body, headers={"Content-Type": body.content_type}, timeout=None)
+    finally:
+        body.close()
+
+
 def upload_gofile(path: Path, folder_id=None):
-    # servidor
-    sv = requests.get("https://api.gofile.io/servers", timeout=15).json()
-    server = sv["data"]["servers"][0]["name"]
-    with path.open("rb") as f:
-        files = {"file": (path.name, f)}
-        data = {}
-        if folder_id:
-            data["folderId"] = folder_id
-        r = requests.post(f"https://{server}.gofile.io/uploadfile", files=files, data=data, timeout=None)
-    j = r.json()
-    if j.get("status") != "ok":
-        raise RuntimeError(str(j))
-    return j["data"].get("downloadPage") or j["data"].get("parentFolder")
+    last = None
+    for attempt in range(2):
+        if attempt == 0:
+            ep = "https://upload.gofile.io/uploadfile"
+        else:
+            try:
+                sv = requests.get("https://api.gofile.io/servers", timeout=15).json()
+                ep = f"https://{sv['data']['servers'][0]['name']}.gofile.io/uploadfile"
+            except Exception:
+                break
+        try:
+            r = _post_multipart(ep, path, {"folderId": folder_id} if folder_id else None)
+            j = r.json()
+            if j.get("status") == "ok":
+                return j["data"].get("downloadPage") or j["data"].get("parentFolder")
+            last = str(j)[:300]
+        except Exception as e:
+            last = str(e)[:300]
+    raise RuntimeError(f"GoFile: {last}")
 
 
 def upload_pixeldrain(path: Path):
@@ -611,8 +920,7 @@ def upload_viking(path: Path):
         server = sv.get("server", "https://upload.vikingfile.com")
     except Exception:
         server = "https://upload.vikingfile.com"
-    with path.open("rb") as f:
-        r = requests.post(server, files={"file": (path.name, f)}, data={"user": ""}, timeout=None)
+    r = _post_multipart(server, path, {"user": ""})
     j = r.json()
     if not j.get("url"):
         raise RuntimeError(str(j))
@@ -655,101 +963,332 @@ UPLOADERS = {
 }
 
 
-def do_upload(path: Path, host: str):
+def do_upload(path: Path, host: str, quiet=False):
     fn = UPLOADERS.get(host)
     if not fn:
-        raise RuntimeError(f"Host desconhecido: {host}. Use: {', '.join(UPLOADERS)}")
-    say(f"⬆️ Enviando para {host}…")
+        raise RuntimeError(f"Host desconhecido: {host}. Use: {', '.join(UPLOADERS)}, telegram")
+    if not quiet:
+        say(f"⬆️ Enviando para {host}…")
     link = fn(path)
-    say(f"✅ {host}: {link}")
+    if not quiet:
+        say(f"✅ {host}: {link}")
     return link
 
 
+def send_result(path: Path, dest: str, caption: str, premium_client, volume_limit) -> str:
+    """Manda um arquivo pro destino (host ou Telegram). Devolve o link ou um texto curto."""
+    if dest == "telegram":
+        deliver(path, caption, premium_client, volume_limit)
+        return "(enviado ao Telegram)"
+    return do_upload(path, dest, quiet=True)
+
+
 # ---------------------------------------------------------------------------
-# Unzip
+# Partes (.zip.001, .z01…), juntar e descompactar
 # ---------------------------------------------------------------------------
-def unzip_and_upload(archive: Path, host: str, tmp: Path):
-    extract_dir = tmp / "extracted"
-    extract_dir.mkdir(exist_ok=True)
-    say("📦 Extraindo…")
-    if archive.suffix.lower() == ".zip" or zipfile.is_zipfile(archive):
-        with zipfile.ZipFile(archive) as zf:
-            zf.extractall(extract_dir)
-    else:
-        # tenta 7z
-        r = subprocess.run(["7z", "x", str(archive), f"-o{extract_dir}", "-y"], capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError("Não consegui extrair (não é ZIP e 7z falhou)")
-    files = [p for p in extract_dir.rglob("*") if p.is_file()]
-    if not files:
-        raise RuntimeError("Nenhum arquivo extraído")
-    say(f"Encontrados {len(files)} arquivo(s). Enviando para {host}…")
-    links = []
-    for f in files:
+SPLIT_RE = re.compile(r"^(?P<base>.+\.[A-Za-z0-9]{2,5})\.(?P<num>\d{3})$")   # a.zip.001, a.7z.001, a.mp4.001
+ZNN_RE = re.compile(r"^(?P<base>.+)\.[zZ](?P<num>\d{2})$")                   # a.z01, a.z02 (+ a.zip no fim)
+LATER_VOL = re.compile(r"(\.z\d{2}|\.r\d{2}|\.part0*(?:[2-9]|[1-9]\d+)\.rar)$", re.I)
+
+
+def is_later_volume(name: str) -> bool:
+    return bool(LATER_VOL.search(name))
+
+
+def group_parts(paths):
+    """Separa os arquivos em conjuntos de partes e arquivos soltos."""
+    num, zs, used = {}, {}, set()
+    for p in paths:
+        m = SPLIT_RE.match(p.name)
+        if m:
+            g = num.setdefault(m["base"].lower(), {"kind": "num", "name": m["base"], "parts": {}})
+            g["parts"].setdefault(int(m["num"]), p)
+            used.add(p)
+            continue
+        m = ZNN_RE.match(p.name)
+        if m:
+            g = zs.setdefault(m["base"].lower(), {"kind": "z", "name": m["base"] + ".zip", "parts": {}, "zip": None})
+            g["parts"].setdefault(int(m["num"]), p)
+            used.add(p)
+    for p in paths:
+        if p.suffix.lower() == ".zip" and p.stem.lower() in zs and zs[p.stem.lower()]["zip"] is None:
+            zs[p.stem.lower()]["zip"] = p
+            used.add(p)
+    groups = []
+    for g in list(num.values()) + list(zs.values()):
+        nums = sorted(g["parts"])
+        g["nums"] = nums
+        g["parts"] = [g["parts"][n] for n in nums]
+        groups.append(g)
+    singles = [p for p in paths if p not in used]
+    return groups, singles
+
+
+def join_group(g, out_dir: Path, for_extract=False) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    missing = [n for n in range(1, max(g["nums"]) + 1) if n not in g["nums"]]
+    if missing:
+        raise RuntimeError("faltam partes: " + ", ".join(f"{n:03d}" for n in missing[:10]))
+    if g["kind"] == "num":
+        out = unique_path(out_dir, g["name"])
+        with out.open("wb") as w:
+            for p in g["parts"]:
+                with p.open("rb") as r:
+                    shutil.copyfileobj(r, w, 1024 * 1024)
+                p.unlink(missing_ok=True)  # libera disco à medida que junta
+        return out
+    # conjunto .z01, .z02 … + .zip final
+    zipf = g.get("zip")
+    if not zipf:
+        raise RuntimeError("falta o arquivo .zip (a última parte do conjunto .z01, .z02…)")
+    if shutil.which("zip"):
+        out = unique_path(out_dir, zipf.name)
+        r = subprocess.run(["zip", "-s", "0", str(zipf), "--out", str(out)],
+                           capture_output=True, text=True, cwd=str(zipf.parent))
+        if r.returncode == 0 and out.exists():
+            for p in g["parts"] + [zipf]:
+                p.unlink(missing_ok=True)
+            return out
+    if for_extract:
+        return zipf  # o 7z abre o .zip e acha os .zNN na mesma pasta
+    raise RuntimeError("não consegui juntar o conjunto .zip/.z01 (precisa do comando zip)")
+
+
+def find_7z():
+    return shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
+
+
+def extract_archive(arc: Path, out: Path):
+    out.mkdir(parents=True, exist_ok=True)
+    if zipfile.is_zipfile(arc):
+        with zipfile.ZipFile(arc) as zf:
+            zf.extractall(out)
+        return
+    b = find_7z()
+    if not b:
+        raise RuntimeError("não é um ZIP e o 7z não está instalado neste runner")
+    r = subprocess.run([b, "x", str(arc), f"-o{out}", "-y"], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("7z falhou: " + (r.stderr or r.stdout or "")[-300:].strip())
+
+
+def run_unzip(files, dest, tmp: Path, premium_client, volume_limit):
+    """Descompacta e envia o conteúdo. Devolve (linhas_ok, erros)."""
+    groups, singles = group_parts(files)
+    archives, errors = [], []
+    for g in groups:
         try:
-            link = do_upload(f, host)
-            links.append(f"{f.name}: {link}")
+            if len(g["parts"]) > 1 or g["kind"] == "z":
+                say(f"🧩 Juntando {len(g['parts'])} parte(s) de {g['name']}…")
+            archives.append(join_group(g, tmp / "joined", for_extract=True))
         except Exception as e:
-            links.append(f"{f.name}: ERRO {e}")
-    say("\n".join(links) or "Nada enviado")
-    return links
+            errors.append(f"{g['name']}: {e}")
+    archives += [p for p in singles if not is_later_volume(p.name)]
+    if not archives:
+        raise RuntimeError("nenhum arquivo compactado para extrair" + (f" ({errors[0]})" if errors else ""))
+    lines = []
+    for idx, arc in enumerate(archives, 1):
+        out = tmp / "extracted" / f"{idx:02d}"
+        try:
+            say(f"📦 Extraindo {arc.name}…")
+            extract_archive(arc, out)
+            extracted = sorted(p for p in out.rglob("*") if p.is_file())
+            if not extracted:
+                raise RuntimeError("nenhum arquivo dentro do arquivo compactado")
+            say(f"{len(extracted)} arquivo(s) em {arc.name}. Enviando para {dest}…")
+            for f in extracted:
+                rel = f.relative_to(out).as_posix()
+                try:
+                    lines.append(f"{rel}: {send_result(f, dest, rel, premium_client, volume_limit)}")
+                except Exception as e:
+                    errors.append(f"{rel}: {e}")
+                f.unlink(missing_ok=True)
+        except Exception as e:
+            errors.append(f"{arc.name}: {e}")
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+            arc.unlink(missing_ok=True)
+    return lines, errors
+
+
+def run_join(files, dest, tmp: Path, premium_client, volume_limit):
+    """Junta partes e envia o arquivo completo. Devolve (linhas_ok, erros)."""
+    groups, singles = group_parts(files)
+    if not groups:
+        raise RuntimeError("não achei partes para juntar. Os nomes precisam seguir o padrão "
+                           ".zip.001, .zip.002… (ou .z01, .z02… + .zip).")
+    lines = []
+    errors = [f"ignorado: {p.name} (não parece parte de um arquivo dividido)" for p in singles]
+    for g in groups:
+        try:
+            say(f"🧩 Juntando {len(g['parts'])} parte(s) de {g['name']}…")
+            out = join_group(g, tmp / "joined")
+            if out.suffix.lower() == ".zip" and not zipfile.is_zipfile(out):
+                say(f"⚠️ {out.name} não parece um ZIP válido (alguma parte pode estar corrompida). Enviando mesmo assim.")
+            lines.append(f"{out.name}: {send_result(out, dest, out.name, premium_client, volume_limit)}")
+            out.unlink(missing_ok=True)
+        except Exception as e:
+            errors.append(f"{g['name']}: {e}")
+    return lines, errors
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+MODES = ("telegram", "link", "upload", "unzip", "join")
+
+
+def normalize_items(payload):
+    items = payload.get("items")
+    if not isinstance(items, list) or not items:  # formato antigo: url / file_id / file_name
+        items = []
+        if payload.get("file_id"):
+            items.append({"file_id": payload["file_id"], "name": payload.get("file_name")})
+        elif payload.get("url"):
+            items.append({"url": payload["url"]})
+    return [i for i in items if isinstance(i, dict)]
+
+
+def job_label(job):
+    if job["kind"] == "tg":
+        return job.get("name") or "arquivo do Telegram"
+    return job["entry"].get("name") or job["entry"]["url"][:80]
+
+
+def fetch_job(job, dl_dir: Path) -> Path:
+    if job["kind"] == "tg":
+        return tg_download(job["file_id"], dl_dir, job.get("name"))
+    e = job["entry"]
+    return download_to(e["url"], dl_dir, e.get("name"), e.get("headers"))
+
+
 def main():
     mode = (PAYLOAD.get("mode") or "telegram").lower()
-    host = (PAYLOAD.get("host") or "gofile").lower()
-    url = PAYLOAD.get("url")
-    file_id = PAYLOAD.get("file_id")
-    file_name = PAYLOAD.get("file_name")
+    host = (PAYLOAD.get("host") or "").lower() or None
+    opts = PAYLOAD.get("opts") if isinstance(PAYLOAD.get("opts"), dict) else {}
+    cb = PAYLOAD.get("cb") if isinstance(PAYLOAD.get("cb"), dict) else None
+    items = normalize_items(PAYLOAD)
 
-    premium_client, volume_limit, mode_desc = select_uploader()
-    say(f"🔧 /uploader | modo={mode} | envio={mode_desc}")
+    if mode not in MODES:
+        raise RuntimeError(f"Modo desconhecido: {mode}")
+    if mode in ("upload", "unzip", "join") and not host:
+        host = "gofile"
+    if mode == "upload" and host == "telegram":
+        mode = "telegram"
+    if mode in ("telegram", "link"):
+        host = None
+    if host and host != "telegram" and host not in UPLOADERS:
+        raise RuntimeError(f"Host desconhecido: {host}. Use: {', '.join(UPLOADERS)}, telegram")
+    if not items:
+        raise RuntimeError("Nenhum url nem file_id recebido")
+    if mode == "link" and any(i.get("file_id") for i in items):
+        raise RuntimeError("O modo link precisa de uma URL (não de um arquivo do Telegram)")
 
+    dest = "telegram" if mode == "telegram" else host
+    if dest == "telegram":
+        premium_client, volume_limit, mode_desc = select_uploader()
+    else:
+        premium_client, volume_limit, mode_desc = None, MAX_MT_BYTES, ""
+    say(f"🔧 /uploader | modo={mode}" + (f" | destino={dest}" if dest else "")
+        + (f" | envio={mode_desc}" if mode_desc else ""))
+
+    # ---- 1) resolve: cada item vira um ou mais downloads ----
+    jobs, pick_ex = [], None
+    for it in items:
+        if it.get("file_id"):
+            jobs.append({"kind": "tg", "file_id": it["file_id"], "name": it.get("name") or it.get("file_name")})
+            continue
+        url = (it.get("url") or "").strip()
+        if not url:
+            continue
+        ex = expand(url)
+        ents = ex["entries"]
+        sel = it.get("select")
+        if sel is not None:
+            wanted = {str(k) for k in sel}
+            ents = [e for e in ents if e["key"] in wanted]
+            if not ents:
+                raise RuntimeError("Nenhum dos arquivos escolhidos foi achado de novo no link (o conteúdo mudou?)")
+        elif opts.get("pick") and len(items) == 1 and len(ents) > 1:
+            pick_ex = ex
+        if len(ents) == 1:
+            say(f"🔍 Resolvido: {ex.get('note')}\n{ents[0]['url'][:200]}")
+        else:
+            say(f"🔍 {ex.get('title') or 'Link'}: {len(ents)} arquivo(s) ({ex.get('note')})")
+        if ex.get("warn"):
+            say(f"⚠️ {ex['warn']}")
+        jobs += [{"kind": "url", "entry": e} for e in ents]
+    if not jobs:
+        raise RuntimeError("Nada para baixar")
+
+    # ---- 2) vários arquivos e o usuário ainda não escolheu: o Worker mostra os botões ----
+    if pick_ex is not None:
+        if post_picker(cb, pick_ex):
+            print("lista entregue ao Worker; aguardando a escolha")
+            return
+        say("⚠️ Não consegui abrir o seletor de arquivos; vou usar todos os arquivos do link.")
+
+    # ---- 3) só links ----
+    if mode == "link":
+        lines = []
+        for j in jobs:
+            e = j["entry"]
+            lines.append(f"{e['name']}: {e['url']}")
+            if e.get("headers"):
+                lines.append("   ↳ precisa dos headers: " + "; ".join(f"{k}: {v}" for k, v in e["headers"].items()))
+        say_long(["🔗 Links diretos:"] + lines)
+        return
+
+    # ---- 4) baixa e processa ----
+    done, errors, results = 0, [], []
     with tempfile.TemporaryDirectory(prefix="uploader-") as td:
         tmp = Path(td)
-        local = None
-        suggested_name = file_name
+        dl = tmp / "dl"
 
-        if file_id:
-            say("⬇️ Baixando do Telegram…")
-            # usa MTProto se for grande, senão Bot API
-            # (simplificado: sempre tenta MTProto se disponível)
-            try:
-                dest = tmp / (file_name or "arquivo")
-                got = bot_client().download_media(file_id, file_name=str(dest))
-                local = Path(got)
-            except Exception as e:
-                raise RuntimeError(f"Download do Telegram falhou: {e}")
-        elif url:
-            resolved = resolve(url)
-            say(f"🔍 Resolvido: {resolved.get('note')}\n{resolved['url'][:200]}")
-            if mode == "link":
-                say(f"🔗 Link direto:\n{resolved['url']}")
-                return
-            local = download_to(resolved["url"], tmp, resolved.get("name") or suggested_name)
-            suggested_name = local.name
-        else:
-            raise RuntimeError("Nenhum url nem file_id recebido")
+        if mode in ("telegram", "upload"):
+            total = len(jobs)
+            for n, job in enumerate(jobs, 1):
+                label = job_label(job)
+                path = None
+                try:
+                    if total > 1:
+                        say(f"▶️ {n}/{total}: {label}")
+                    path = fetch_job(job, dl)
+                    if mode == "telegram":
+                        deliver(path, path.name, premium_client, volume_limit)
+                    else:
+                        results.append(f"{path.name}: {do_upload(path, host, quiet=total > 1)}")
+                    done += 1
+                except Exception as e:
+                    print(f"erro em {label}: {e}", file=sys.stderr)
+                    errors.append(f"{label}: {e}")
+                finally:
+                    if path:
+                        path.unlink(missing_ok=True)
+        else:  # unzip / join: precisa de todos os arquivos juntos na mesma pasta
+            files = []
+            for n, job in enumerate(jobs, 1):
+                label = job_label(job)
+                try:
+                    if len(jobs) > 1:
+                        say(f"⬇️ {n}/{len(jobs)}: {label}")
+                    files.append(fetch_job(job, dl))
+                except Exception as e:
+                    errors.append(f"{label}: {e}")
+            if files:
+                runner = run_unzip if mode == "unzip" else run_join
+                lines, errs = runner(files, dest, tmp, premium_client, volume_limit)
+                results += lines
+                errors += errs
+                done += len(lines)
 
-        if not local or not local.exists():
-            raise RuntimeError("Arquivo não encontrado após download")
-
-        caption = suggested_name or local.name
-
-        if mode == "link":
-            # já tratado acima
-            return
-        elif mode == "upload":
-            do_upload(local, host)
-        elif mode == "unzip":
-            unzip_and_upload(local, host, tmp)
-        else:  # telegram
-            deliver(local, caption, premium_client, volume_limit)
-
-    say("✅ /uploader concluído.")
+    if results and (len(results) > 1 or mode in ("unzip", "join")):
+        say_long(["✅ Links:"] + results)
+    if errors:
+        say_long(["⚠️ Falhas:"] + errors)
+    if not done:
+        raise RuntimeError("nada foi enviado" + (f": {errors[0]}" if errors else ""))
+    say("✅ /uploader concluído." + (f" ({len(errors)} com erro)" if errors else ""))
 
 
 if __name__ == "__main__":
