@@ -254,78 +254,240 @@ def deliver(path, caption, premium_client, volume_limit):
 
 
 # ---------------------------------------------------------------------------
-# Resolvers (principais hosts do FileHost Toolkit)
+# Resolvers (FileHost Toolkit — máximo de sites possível no servidor)
 # ---------------------------------------------------------------------------
+def _get(url, **kw):
+    kw.setdefault("headers", UA)
+    kw.setdefault("timeout", 25)
+    r = requests.get(url, **kw)
+    r.raise_for_status()
+    return r
+
+
+def _head(url, **kw):
+    kw.setdefault("headers", UA)
+    kw.setdefault("timeout", 15)
+    kw.setdefault("allow_redirects", True)
+    return requests.head(url, **kw)
+
+
 def resolve(url: str) -> dict:
     """Devolve {"url": link_direto, "name": nome_sugerido, "note": "..."}"""
     url = url.strip()
-    host = urlparse(url).hostname or ""
-    host = host.lower().replace("www.", "")
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().replace("www.", "")
 
-    # Link direto óbvio
-    if any(host.endswith(h) for h in ("githubusercontent.com", "cdn.", "media.", "download.")):
-        return {"url": url, "name": Path(urlparse(url).path).name or "arquivo", "note": "link direto"}
+    # ---------- links diretos óbvios ----------
+    if host.endswith("githubusercontent.com") or host.startswith(("cdn.", "download.")):
+        name = Path(parsed.path).name or None
+        return {"url": url, "name": name, "note": "link direto"}
 
-    # PixelDrain
+    # ---------- PixelDrain ----------
     if "pixeldrain.com" in host or "pixeldra.in" in host:
         m = re.search(r"/u/([A-Za-z0-9]+)", url)
         if m:
             return {"url": f"https://pixeldrain.com/api/file/{m.group(1)}?download",
-                    "name": None, "note": "PixelDrain API"}
+                    "name": None, "note": "PixelDrain"}
 
-    # GoFile
+    # ---------- GoFile ----------
     if "gofile.io" in host:
         m = re.search(r"/d/([A-Za-z0-9]+)", url)
         if m:
-            # tenta pegar o conteúdo
             try:
-                r = requests.get(f"https://api.gofile.io/contents/{m.group(1)}", headers=UA, timeout=20)
+                r = _get(f"https://api.gofile.io/contents/{m.group(1)}")
                 j = r.json()
                 if j.get("status") == "ok":
-                    contents = j["data"].get("contents") or {}
-                    files = [v for v in contents.values() if v.get("type") == "file"]
+                    contents = (j.get("data") or {}).get("contents") or {}
+                    files = [v for v in contents.values() if isinstance(v, dict) and v.get("type") == "file"]
                     if files:
                         f = files[0]
-                        return {"url": f.get("link") or f.get("directLink"),
+                        return {"url": f.get("link") or f.get("directLink") or url,
                                 "name": f.get("name"), "note": "GoFile"}
             except Exception:
                 pass
-        return {"url": url, "name": None, "note": "GoFile (não resolvido automaticamente)"}
+        return {"url": url, "name": None, "note": "GoFile (não resolvido)"}
 
-    # VikingFile
+    # ---------- VikingFile ----------
     if "vikingfile.com" in host or "vik1ngfile" in host:
-        return {"url": url, "name": None, "note": "VikingFile (use o link da página; download costuma ser direto após o clique)"}
+        return {"url": url, "name": None, "note": "VikingFile"}
 
-    # MediaFire
+    # ---------- MediaFire ----------
     if "mediafire.com" in host:
         try:
-            r = requests.get(url, headers=UA, timeout=25)
-            r.raise_for_status()
+            r = _get(url)
             m = re.search(r'href="(https://download[^"]+)"', r.text)
             if not m:
-                m = re.search(r"aria-label=\"Download file\"[^>]*href=\"([^\"]+)\"", r.text)
+                m = re.search(r'aria-label="Download file"[^>]*href="([^"]+)"', r.text)
             if m:
                 return {"url": m.group(1), "name": None, "note": "MediaFire"}
         except Exception as e:
-            return {"url": url, "name": None, "note": f"MediaFire (falha ao resolver: {e})"}
+            return {"url": url, "name": None, "note": f"MediaFire ({e})"}
 
-    # Google Drive (público)
+    # ---------- Google Drive ----------
     if "drive.google.com" in host or "docs.google.com" in host:
-        m = re.search(r"/d/([A-Za-z0-9_-]+)", url) or re.search(r"id=([A-Za-z0-9_-]+)", url)
+        m = re.search(r"/d/([A-Za-z0-9_-]+)", url) or re.search(r"[?&]id=([A-Za-z0-9_-]+)", url)
         if m:
-            fid = m.group(1)
-            return {"url": f"https://drive.google.com/uc?export=download&id={fid}",
-                    "name": None, "note": "Google Drive (público)"}
+            return {"url": f"https://drive.google.com/uc?export=download&confirm=t&id={m.group(1)}",
+                    "name": None, "note": "Google Drive"}
 
-    # Filebin
+    # ---------- Filebin ----------
     if "filebin.net" in host:
-        return {"url": url, "name": Path(urlparse(url).path).name, "note": "Filebin"}
+        return {"url": url, "name": Path(parsed.path).name or None, "note": "Filebin"}
 
-    # Fallback: tenta HEAD e vê se já é download
+    # ---------- imgur.gg ----------
+    if "imgur.gg" in host:
+        try:
+            if "/f/" in url or "/archive/" in url or "/zip/" in url:
+                r = _get(url)
+                m = re.search(r'bucketKey["\s:]+["\']([^"\']+)', r.text)
+                if m:
+                    return {"url": f"https://b.imgur.gg/{m.group(1)}", "name": None, "note": "imgur.gg"}
+        except Exception:
+            pass
+        return {"url": url, "name": None, "note": "imgur.gg"}
+
+    # ---------- Pillows / Pillowcase ----------
+    if "pillows.su" in host or "pillowcase.su" in host:
+        m = re.search(r"([0-9a-f]{32})", url, re.I)
+        if m:
+            return {"url": f"https://api.pillows.su/api/download/{m.group(1)}",
+                    "name": None, "note": "Pillows"}
+
+    # ---------- ExoShare ----------
+    if "exoshare.org" in host or "exoshare" in host:
+        return {"url": url, "name": None, "note": "ExoShare (API pode precisar de share id)"}
+
+    # ---------- BuzzHeavier ----------
+    if "buzzheavier.com" in host or "bzzhr" in host:
+        m = re.search(r"/([A-Za-z0-9]+)/?$", parsed.path)
+        if m:
+            return {"url": f"https://buzzheavier.com/{m.group(1)}/download",
+                    "name": None, "note": "BuzzHeavier"}
+
+    # ---------- KrakenFiles ----------
+    if "krakenfiles.com" in host:
+        try:
+            r = _get(url)
+            m = re.search(r'href="(/download/[^"]+)"', r.text)
+            if m:
+                return {"url": "https://krakenfiles.com" + m.group(1), "name": None, "note": "KrakenFiles"}
+        except Exception:
+            pass
+        return {"url": url, "name": None, "note": "KrakenFiles"}
+
+    # ---------- upload.ee ----------
+    if "upload.ee" in host:
+        try:
+            r = _get(url)
+            m = re.search(r'href="(https://[^"]+\.upload\.ee/[^"]+)"', r.text)
+            if m:
+                return {"url": m.group(1), "name": None, "note": "upload.ee"}
+        except Exception:
+            pass
+
+    # ---------- send.cm / tmpsend ----------
+    if "send.cm" in host or "tmpsend.com" in host:
+        return {"url": url, "name": None, "note": "send.cm / tmpsend"}
+
+    # ---------- qiwi.gg ----------
+    if "qiwi.gg" in host:
+        return {"url": url, "name": None, "note": "qiwi.gg"}
+
+    # ---------- mp4upload ----------
+    if "mp4upload.com" in host:
+        return {"url": url, "name": None, "note": "mp4upload"}
+
+    # ---------- akmfiles / hxfile / shrdsk ----------
+    if any(x in host for x in ("akmfiles.com", "akmfls.xyz", "hxfile.co", "shrdsk.me")):
+        return {"url": url, "name": None, "note": host}
+
+    # ---------- pCloud ----------
+    if "pcloud.link" in host or "u.pcloud.link" in host:
+        return {"url": url, "name": None, "note": "pCloud"}
+
+    # ---------- transfer.it ----------
+    if "transfer.it" in host:
+        return {"url": url, "name": None, "note": "transfer.it"}
+
+    # ---------- solidfiles ----------
+    if "solidfiles.com" in host:
+        try:
+            r = _get(url)
+            m = re.search(r'"downloadUrl":"([^"]+)"', r.text)
+            if m:
+                return {"url": m.group(1).replace("\\/", "/"), "name": None, "note": "SolidFiles"}
+        except Exception:
+            pass
+
+    # ---------- Yandex Disk ----------
+    if "yadi.sk" in host or "disk.yandex" in host:
+        try:
+            api_url = f"https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key={quote(url)}"
+            r = _get(api_url)
+            j = r.json()
+            if j.get("href"):
+                return {"url": j["href"], "name": None, "note": "Yandex Disk"}
+        except Exception:
+            pass
+        return {"url": url, "name": None, "note": "Yandex Disk"}
+
+    # ---------- WeTransfer ----------
+    if "wetransfer.com" in host or "we.tl" in host:
+        return {"url": url, "name": None, "note": "WeTransfer (pode precisar de interação)"}
+
+    # ---------- SwissTransfer ----------
+    if "swisstransfer.com" in host:
+        return {"url": url, "name": None, "note": "SwissTransfer"}
+
+    # ---------- SendGB ----------
+    if "sendgb.com" in host:
+        return {"url": url, "name": None, "note": "SendGB"}
+
+    # ---------- Dropbox ----------
+    if "dropbox.com" in host:
+        if "?" in url:
+            return {"url": url.replace("?dl=0", "?dl=1").split("&")[0] + ("&dl=1" if "dl=1" not in url else ""),
+                    "name": None, "note": "Dropbox"}
+        return {"url": url + ("&" if "?" in url else "?") + "dl=1", "name": None, "note": "Dropbox"}
+
+    # ---------- Terabox ----------
+    if any(x in host for x in ("terabox.com", "1024tera.com", "teraboxapp.com", "freeterabox.com")):
+        return {"url": url, "name": None, "note": "Terabox (resolução limitada no servidor)"}
+
+    # ---------- Box ----------
+    if "box.com" in host:
+        return {"url": url, "name": None, "note": "Box (use o modo zip_download se possível)"}
+
+    # ---------- OneDrive ----------
+    if "onedrive.live.com" in host or "1drv.ms" in host:
+        return {"url": url, "name": None, "note": "OneDrive (melhor via downloadUrl capturado)"}
+
+    # ---------- SourceForge ----------
+    if "sourceforge.net" in host:
+        if "/download" not in url:
+            return {"url": url.rstrip("/") + "/download", "name": None, "note": "SourceForge"}
+        return {"url": url, "name": None, "note": "SourceForge"}
+
+    # ---------- GitHub Releases ----------
+    if "github.com" in host and "/releases/" in url:
+        return {"url": url, "name": Path(parsed.path).name, "note": "GitHub Release"}
+
+    # ---------- Streamtape / Dood (limitado) ----------
+    if any(x in host for x in ("streamtape.com", "streamtape.to", "dood.", "doods.pro", "ds2play.com")):
+        return {"url": url, "name": None, "note": f"{host} (player, resolução limitada)"}
+
+    # ---------- fuckingfast / lulacloud / devuploads / uploadhaven ----------
+    if any(x in host for x in ("fuckingfast.co", "lulacloud.com", "devuploads.com", "uploadhaven.com")):
+        return {"url": url, "name": None, "note": host}
+
+    # ---------- Fallback HEAD ----------
     try:
-        h = requests.head(url, headers=UA, allow_redirects=True, timeout=15)
+        h = _head(url)
         cd = h.headers.get("content-disposition", "")
-        if "attachment" in cd.lower() or h.headers.get("content-type", "").startswith(("application/", "video/", "audio/")):
+        ct = h.headers.get("content-type", "")
+        if "attachment" in cd.lower() or ct.startswith(("application/", "video/", "audio/", "image/")):
             name = None
             m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', cd)
             if m:
@@ -339,7 +501,7 @@ def resolve(url: str) -> dict:
 
 def download_to(url, dest: Path, name_hint=None):
     dest.parent.mkdir(parents=True, exist_ok=True)
-    say(f"⬇️ Baixando…")
+    say("⬇️ Baixando…")
     with requests.get(url, headers=UA, stream=True, timeout=120) as r:
         r.raise_for_status()
         # nome a partir do Content-Disposition se não tiver
@@ -410,7 +572,8 @@ def upload_buzz(path: Path):
         )
     if r.status_code >= 400:
         raise RuntimeError(r.text[:300])
-    return f"https://buzzheavier.com/{r.text.strip().strip('\"')}"
+    file_code = r.text.strip().strip('"')
+    return f"https://buzzheavier.com/{file_code}"
 
 
 def upload_filebin(path: Path):
