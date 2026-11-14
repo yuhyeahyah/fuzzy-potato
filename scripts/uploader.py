@@ -12,6 +12,7 @@ Secrets necessários (mesmo dos outros workflows):
   BOT_TOKEN, TG_API_ID, TG_API_HASH
   TG_PREMIUM_SESSION (opcional, para ~4 GB)
 """
+import base64
 import io
 import json
 import math
@@ -22,7 +23,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
-from html import escape as esc
+from html import escape as esc, unescape
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 
@@ -271,6 +272,24 @@ def _head(url, **kw):
     return requests.head(url, **kw)
 
 
+TERABOX_HOSTS = (
+    "terabox.com", "nephobox.com", "4funbox.com", "mirrobox.com", "momerybox.com",
+    "teraboxapp.com", "1024tera.com", "terabox.app", "gibibox.com", "goaibox.com",
+    "terasharelink.com", "teraboxlink.com", "freeterabox.com", "1024terabox.com",
+    "teraboxshare.com", "terafileshare.com", "terabox.club",
+)
+STREAMTAPE_HOSTS = (
+    "streamtape.com", "streamtape.co", "streamtape.cc", "streamtape.to",
+    "streamtape.net", "streamta.pe", "streamtape.xyz",
+)
+DOOD_HOSTS = (
+    "dood.watch", "doodstream.com", "dood.to", "dood.so", "dood.cx", "dood.la", "dood.ws",
+    "dood.sh", "doodstream.co", "dood.pm", "dood.wf", "dood.re", "dood.video", "dooood.com",
+    "dood.yt", "doods.yt", "dood.stream", "doods.pro", "ds2play.com", "d0o0d.com",
+    "ds2video.com", "do0od.com", "d000d.com",
+)
+
+
 def resolve(url: str) -> dict:
     """Devolve {"url": link_direto, "name": nome_sugerido, "note": "..."}"""
     url = url.strip()
@@ -284,8 +303,12 @@ def resolve(url: str) -> dict:
         name = Path(parsed.path).name or None
         return {"url": url, "name": name, "note": "link direto"}
 
+    # ---------- Dropbox (link já direto) ----------
+    if host.endswith("dropboxusercontent.com"):
+        return {"url": url, "name": Path(parsed.path).name or None, "note": "Dropbox (link direto)"}
+
     # ---------- PixelDrain ----------
-    if "pixeldrain.com" in host or "pixeldra.in" in host:
+    if any(host.endswith(d) for d in ("pixeldrain.com", "pixeldrain.net", "pixeldrain.dev", "pixeldra.in")):
         m = re.search(r"/u/([A-Za-z0-9]+)", url)
         if m:
             return {"url": f"https://pixeldrain.com/api/file/{m.group(1)}?download",
@@ -326,7 +349,7 @@ def resolve(url: str) -> dict:
             return {"url": url, "name": None, "note": f"MediaFire ({e})"}
 
     # ---------- Google Drive ----------
-    if "drive.google.com" in host or "docs.google.com" in host:
+    if any(x in host for x in ("drive.google.com", "docs.google.com", "drive.usercontent.google.com")):
         m = re.search(r"/d/([A-Za-z0-9_-]+)", url) or re.search(r"[?&]id=([A-Za-z0-9_-]+)", url)
         if m:
             return {"url": f"https://drive.google.com/uc?export=download&confirm=t&id={m.group(1)}",
@@ -453,7 +476,7 @@ def resolve(url: str) -> dict:
         return {"url": url + ("&" if "?" in url else "?") + "dl=1", "name": None, "note": "Dropbox"}
 
     # ---------- Terabox ----------
-    if any(x in host for x in ("terabox.com", "1024tera.com", "teraboxapp.com", "freeterabox.com")):
+    if any(x in host for x in TERABOX_HOSTS):
         return {"url": url, "name": None, "note": "Terabox (resolução limitada no servidor)"}
 
     # ---------- Box ----------
@@ -463,6 +486,38 @@ def resolve(url: str) -> dict:
     # ---------- OneDrive ----------
     if "onedrive.live.com" in host or "1drv.ms" in host:
         return {"url": url, "name": None, "note": "OneDrive (melhor via downloadUrl capturado)"}
+
+    # ---------- BerkasDrive ----------
+    if "berkasdrive.com" in host:
+        try:
+            r = _get(url)
+            m = re.search(r"<script\b[^>]*>(.*?)</script>", r.text, re.S | re.I)
+            if m:
+                parts = m.group(1).split('"')
+                if len(parts) > 1:
+                    direct = base64.b64decode(parts[1]).decode("utf-8", "ignore").strip()
+                    if direct.startswith(("http://", "https://")):
+                        return {"url": direct, "name": None, "note": "BerkasDrive"}
+        except Exception as e:
+            return {"url": url, "name": None, "note": f"BerkasDrive ({e})"}
+
+    # ---------- OSDN ----------
+    if "osdn.net" in host:
+        try:
+            r = _get(url)
+            tag = re.search(r'<a\b[^>]*\bclass="[^"]*\bmirror_link\b[^"]*"[^>]*>', r.text)
+            href = re.search(r'href="([^"]+)"', tag.group(0)) if tag else None
+            if href:
+                link = unescape(href.group(1))
+                if link.startswith("/"):
+                    link = "https://osdn.net" + link
+                return {"url": link, "name": None, "note": "OSDN"}
+        except Exception as e:
+            return {"url": url, "name": None, "note": f"OSDN ({e})"}
+
+    # ---------- send.now ----------
+    if host == "send.now" or host.endswith(".send.now"):
+        return {"url": url, "name": None, "note": "send.now (sem endpoint conhecido)"}
 
     # ---------- SourceForge ----------
     if "sourceforge.net" in host:
@@ -475,7 +530,7 @@ def resolve(url: str) -> dict:
         return {"url": url, "name": Path(parsed.path).name, "note": "GitHub Release"}
 
     # ---------- Streamtape / Dood (limitado) ----------
-    if any(x in host for x in ("streamtape.com", "streamtape.to", "dood.", "doods.pro", "ds2play.com")):
+    if any(host == d or host.endswith("." + d) for d in STREAMTAPE_HOSTS + DOOD_HOSTS):
         return {"url": url, "name": None, "note": f"{host} (player, resolução limitada)"}
 
     # ---------- fuckingfast / lulacloud / devuploads / uploadhaven ----------
