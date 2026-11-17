@@ -44,14 +44,30 @@ def make_emoji_image(im):
     return canvas
 
 
+def split_logo(im, max_parts=7):
+    im = im.convert("RGBA")
+    bbox = im.getbbox()
+    if bbox:
+        im = im.crop(bbox)
+    w, h = im.size
+    if w < 120:
+        return [im]
+    parts = max(3, min(max_parts, w // 70))
+    slice_w = w // parts
+    tiles = []
+    for i in range(parts):
+        left = i * slice_w
+        right = w if i == parts - 1 else (i + 1) * slice_w
+        tile = im.crop((left, 0, right, h))
+        tiles.append(tile)
+    return tiles
+
+
 def upload_emoji(im, set_name, owner_id, emoji="⭐"):
     im = make_emoji_image(im)
-
-    # salva em arquivo temporário (mais confiável pro Telegram)
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         im.save(tmp, format="PNG")
         tmp_path = tmp.name
-
     try:
         with open(tmp_path, "rb") as f:
             files = {"png_sticker": ("emoji.png", f, "image/png")}
@@ -64,17 +80,14 @@ def upload_emoji(im, set_name, owner_id, emoji="⭐"):
             }
             r = tg("addStickerToSet", data=data, files=files)
             if not r.get("ok"):
-                # reabre o arquivo pro create
                 f.seek(0)
                 r = tg("createNewStickerSet", data=data, files=files)
             if not r.get("ok"):
-                raise RuntimeError(r.get("description", "falha emoji") + " | raw: " + str(r))
+                raise RuntimeError(r.get("description", "falha emoji"))
     finally:
         os.unlink(tmp_path)
 
     info = tg("getStickerSet", data={"name": set_name})
-    if not info.get("ok"):
-        raise RuntimeError("não consegui ler o set depois de criar")
     return info["result"]["stickers"][-1]["custom_emoji_id"]
 
 
@@ -95,7 +108,8 @@ def main():
 
     if logo_url:
         im = download_image(logo_url)
-        result["logo_ids"].append(upload_emoji(im, set_name, owner_id))
+        for tile in split_logo(im):
+            result["logo_ids"].append(upload_emoji(tile, set_name, owner_id))
 
     if cover_url:
         im = download_image(cover_url)
