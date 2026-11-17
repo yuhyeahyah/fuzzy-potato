@@ -962,6 +962,8 @@ def sendgb_presign(e: dict) -> str:
 # ---------- imgur.gg (arquivos /f/ID; o JSON da página traz bucketKey e nome) ----------
 def imgurgg_expand(url: str) -> dict:
     html = _get(url, timeout=30).text
+    if "/archive/" in urlparse(url).path:
+        return imgurgg_archive(url, html)
     txt = html.replace('\\"', '"').replace("\\u0026", "&")
     entries, seen = [], set()
     for mk in re.finditer(r'"bucketKey":"([^"]+)"', txt):
@@ -991,8 +993,169 @@ def imgurgg_expand(url: str) -> dict:
     return {"title": title, "entries": _finalize(entries), "warn": "", "note": "imgur.gg"}
 
 
+# ---------- imgur.gg /archive/ID (lista de arquivos no JSON da página) ----------
+def _json_after(txt: str, marker: str):
+    """Decodifica o valor JSON que vem logo depois de `marker` (ex.: '"files":')."""
+    i = txt.find(marker)
+    if i < 0:
+        return None
+    try:
+        return json.JSONDecoder().raw_decode(txt[i + len(marker):])[0]
+    except ValueError:
+        return None
+
+
+def imgurgg_archive(url: str, html: str) -> dict:
+    txt = html.replace('\\"', '"').replace("\\u0026", "&").replace("\\\\", "\\")
+    files = _json_after(txt, '"files":') or []
+    entries = []
+    for f in files:
+        if not isinstance(f, dict) or not f.get("id"):
+            continue
+        fid, stored = f["id"], f.get("name") or ""
+        name = f.get("originalName") or stored or fid
+        direct = f"https://b.imgur.gg/{quote(fid + '-' + stored)}?download={quote(name)}" if stored else None
+        api_dl = f"https://imgur.gg/api/file/{fid}/download"
+        entries.append({"url": direct or api_dl, "fallback": api_dl if direct else None,
+                        "name": name, "size": f.get("size") or 0,
+                        "headers": {"Referer": "https://imgur.gg/"}})
+    if not entries:
+        raise RuntimeError("imgur.gg: não achei a lista de arquivos do arquivo/álbum")
+    m = re.search(r"/archive/([A-Za-z0-9]+)", url)
+    return {"title": f"imgur.gg archive {m.group(1) if m else ''}".strip(),
+            "entries": _finalize(entries), "warn": "", "note": "imgur.gg (archive)"}
+
+
+# ---------- Pillows / Pillowcase (o nome real vem no JSON do SvelteKit na página) ----------
+def pillows_expand(url: str) -> dict:
+    m = re.search(r"([0-9a-f]{32})", url, re.I)
+    if not m:
+        raise RuntimeError("Pillows: não achei o ID no link")
+    fid = m.group(1).lower()
+    name, size = None, 0
+    try:
+        html = _get(f"https://pillows.su/f/{fid}", timeout=30).text
+        n = (re.search(r'filename:"((?:[^"\\]|\\.)*)"', html)
+             or re.search(r'<meta property="og:title" content="([^"]+)"', html)
+             or re.search(r"<title>(.*?) \| Pillowcase</title>", html, re.S))
+        if n:
+            name = unescape(n.group(1))
+            try:
+                name = json.loads(f'"{name}"')
+            except ValueError:
+                pass
+        s = re.search(r"fileSize:(\d+)n?", html)
+        size = int(s.group(1)) if s else 0
+    except Exception as e:
+        print("pillows: página falhou:", e, file=sys.stderr)
+    if not name:  # sem página: tenta o nome que o servidor manda no download
+        try:
+            h = _head(f"https://api.pillows.su/api/download/{fid}")
+            c = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', h.headers.get("content-disposition", ""))
+            name = unquote(c.group(1)) if c else None
+        except Exception:
+            pass
+    ents = _finalize([{"url": f"https://api.pillows.su/api/download/{fid}", "name": name or fid, "size": size,
+                       "fallback": f"https://api.pillows.su/api/get/{fid}"}])
+    return {"title": name or "Pillows", "entries": ents, "warn": "" if name else "não achei o nome do arquivo",
+            "note": "Pillows"}
+
+
+# ---------- WeTransfer (lista no __NEXT_DATA__; link assinado pedido na hora de baixar) ----------
+WT_API = "https://wetransfer.com/api/v4/transfers"
+
+
+def _wt_session(page_url: str):
+    s = requests.Session()
+    s.headers.update(UA)
+    r = s.get(page_url, timeout=30, allow_redirects=True)
+    r.raise_for_status()
+    csrf = re.search(r'name="csrf-token" content="([^"]+)"', r.text)
+    s.headers.update({"x-requested-with": "XMLHttpRequest", "Origin": "https://wetransfer.com",
+                      "Referer": r.url, "Accept": "application/json"})
+    if csrf:
+        s.headers["x-csrf-token"] = csrf.group(1)
+    return s, r
+
+
+def _wt_parse(u: str):
+    p = [x for x in urlparse(u).path.split("/") if x]
+    if "downloads" not in p:
+        return None
+    p = p[p.index("downloads") + 1:]
+    if len(p) == 2:
+        return p[0], None, p[1]
+    if len(p) >= 3:
+        return p[0], p[1], p[2]
+    return None
+
+
+def wetransfer_expand(url: str) -> dict:
+    s, r = _wt_session(url)          # segue o redirect do we.tl
+    ids = _wt_parse(r.url) or _wt_parse(url)
+    if not ids:
+        raise RuntimeError("WeTransfer: link sem /downloads/ID/HASH")
+    tid, rid, sec = ids
+    tr = {}
+    nd = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
+    if nd:
+        try:
+            tr = json.loads(nd.group(1))["props"]["pageProps"].get("initialTransfer") or {}
+        except (ValueError, KeyError, TypeError):
+            tr = {}
+    if not tr.get("items"):
+        body = {"security_hash": sec}
+        if rid:
+            body["recipient_id"] = rid
+        tr = s.post(f"{WT_API}/{tid}/prepare-download", json=body, timeout=30).json()
+    if tr.get("password_protected"):
+        raise RuntimeError("WeTransfer: transferência protegida por senha")
+    if tr.get("state") not in (None, "downloadable"):
+        raise RuntimeError(f"WeTransfer: transferência indisponível ({tr.get('state')})")
+    entries = []
+    for it in tr.get("items") or []:
+        if it.get("item_type", "file") != "file" or not it.get("id"):
+            continue
+        full = it.get("name") or it["id"]
+        path, _, name = full.rpartition("/")
+        entries.append({"url": f"{WT_API}/{tid}/download#{it['id']}", "presign": "wetransfer",
+                        "wt": {"tid": tid, "rid": rid, "sec": sec, "fid": it["id"]},
+                        "name": name, "path": path, "size": it.get("size") or 0})
+    if not entries:
+        raise RuntimeError("WeTransfer: nenhum arquivo na transferência")
+    warn = []
+    total = sum(e["size"] for e in entries)
+    free = shutil.disk_usage(".").free
+    if max(e["size"] for e in entries) > free:
+        warn.append(f"tem arquivo maior que o disco livre do runner ({free / 2**30:.0f} GiB); esse vai falhar")
+    elif total > free:
+        warn.append(f"o total ({total / 2**30:.1f} GiB) passa do disco livre ({free / 2**30:.0f} GiB); escolha menos arquivos")
+    return {"title": tr.get("display_name") or tr.get("recommended_filename") or "WeTransfer",
+            "entries": _finalize(entries), "warn": "; ".join(warn), "note": "WeTransfer"}
+
+
+def wetransfer_link(e: dict) -> str:
+    w = e["wt"]
+    page = f"https://wetransfer.com/downloads/{w['tid']}/" + (f"{w['rid']}/" if w.get("rid") else "") + w["sec"]
+    s, _ = _wt_session(page)
+    body = {"security_hash": w["sec"], "intent": "single_file", "file_ids": [w["fid"]]}
+    if w.get("rid"):
+        body["recipient_id"] = w["rid"]
+    r = s.post(f"{WT_API}/{w['tid']}/download", json=body, timeout=30)
+    try:
+        j = r.json()
+    except ValueError:
+        j = {}
+    link = j.get("direct_link")
+    if not link:
+        raise RuntimeError(f"WeTransfer não devolveu o link (HTTP {r.status_code}: {str(j or r.text)[:200]})")
+    return link
+
+
 def entry_url(e: dict) -> str:
     """Link final de uma entrada (alguns hosts só assinam o link na hora de baixar)."""
+    if e.get("presign") == "wetransfer":
+        return wetransfer_link(e)
     if e.get("presign"):
         return sendgb_presign(e)
     return e["url"]
@@ -1016,8 +1179,12 @@ def expand(url: str) -> dict:
             return box_expand(url)
         if host.endswith("sendgb.com"):
             return sendgb_expand(url)
-        if host == "imgur.gg":
+        if host in ("imgur.gg", "m.imgur.gg"):
             return imgurgg_expand(url)
+        if host in ("pillows.su", "pillowcase.su", "api.pillows.su"):
+            return pillows_expand(url)
+        if host.endswith(("wetransfer.com", "we.tl")):
+            return wetransfer_expand(url)
     except Exception as e:  # cai no resolve() simples
         print("expand falhou:", e, file=sys.stderr)
         warn = f"não consegui listar o conteúdo ({e})"
@@ -1384,9 +1551,20 @@ def fetch_job(job, dl_dir: Path) -> Path:
     if job["kind"] == "tg":
         return tg_download(job["file_id"], dl_dir, job.get("name"))
     e = job["entry"]
+    size = e.get("size") or 0
+    if size:
+        free = shutil.disk_usage(dl_dir if dl_dir.exists() else ".").free
+        if size > free - 512 * 2**20:
+            raise RuntimeError(f"{e.get('name')}: {size / 2**30:.1f} GiB não cabe no disco do runner "
+                               f"({free / 2**30:.1f} GiB livres)")
     if e.get("presign"):
         return download_to(entry_url(e), dl_dir, e.get("name"))
-    return download_to(e["url"], dl_dir, e.get("name"), e.get("headers"))
+    try:
+        return download_to(e["url"], dl_dir, e.get("name"), e.get("headers"))
+    except Exception:
+        if not e.get("fallback"):
+            raise
+        return download_to(e["fallback"], dl_dir, e.get("name"), e.get("headers"))
 
 
 def main():
