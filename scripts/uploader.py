@@ -779,6 +779,225 @@ def onedrive_expand(url: str) -> dict:
     return {"title": j.get("name") or "", "entries": ents, "warn": "; ".join(warn), "note": "OneDrive"}
 
 
+# ---------- Box (mesma leitura do box2gofile.py: Box.postStreamData da página) ----------
+BOX_MAX_DEPTH = 6
+BOX_MAX_FILES = 2000
+
+
+def box_expand(url: str) -> dict:
+    p = urlparse(url)
+    m = re.match(r"^(/(?:s|v)/[A-Za-z0-9_\-]+)", p.path)
+    base = f"{p.scheme}://{p.netloc}"
+    if "zip_download" in url or "box_download_shared_file" in url:
+        return {"title": "Box", "entries": _finalize([{"url": url, "name": None, "size": 0}]),
+                "warn": "", "note": "Box (link direto)"}
+    if not m:
+        raise RuntimeError("não parece um link compartilhado do Box (/s/... ou /v/...)")
+    root = m.group(1)
+    st = {"shared": None, "warn": []}
+
+    def load(u):
+        html = _get(u, timeout=30).text
+        mm = re.search(r"Box\.postStreamData\s*=\s*(\{.*?\});\s*</script>", html, re.S)
+        if not mm:
+            return None, html
+        try:
+            data = json.loads(mm.group(1))
+        except ValueError:
+            return None, html
+        si = data.get("/app-api/enduserapp/shared-item") or {}
+        if si.get("sharedName") and not st["shared"]:
+            st["shared"] = si["sharedName"]   # no /v/nome o shared_name real é outro
+        return data, html
+
+    def direct(fid):
+        return (f"{base}/index.php?rm=box_download_shared_file"
+                f"&shared_name={st['shared']}&file_id=f_{fid}")
+
+    def parse(data):
+        folder = data.get("/app-api/enduserapp/shared-folder")
+        if not folder:
+            return None, []
+        if (folder.get("pageCount") or 1) > 1:
+            st["warn"].append(f"'{folder.get('currentFolderName')}' tem mais de uma página; só a primeira foi lida")
+        return folder.get("currentFolderName"), folder.get("items") or []
+
+    entries = []
+
+    def walk(items, path, depth):
+        for it in items:
+            if len(entries) >= BOX_MAX_FILES:
+                return
+            name = it.get("name") or "arquivo"
+            if it.get("type") == "file":
+                entries.append({"url": direct(it["id"]), "name": name, "size": it.get("itemSize") or 0, "path": path})
+            elif depth < BOX_MAX_DEPTH:
+                d, _ = load(f"{base}{root}/folder/{it['id']}")
+                if not d:
+                    st["warn"].append(f"não consegui abrir a pasta '{name}'")
+                    continue
+                _, sub = parse(d)
+                walk(sub, (path + "/" if path else "") + safe_name(name), depth + 1)
+            else:
+                st["warn"].append(f"pasta '{name}' muito funda, ignorada")
+
+    data, html = load(url)
+    title = ""
+    if data:
+        si = data.get("/app-api/enduserapp/shared-item") or {}
+        if si.get("itemType") == "file":
+            fi = data.get("/app-api/enduserapp/shared-file") or {}
+            entries.append({"url": direct(si["itemID"]), "name": fi.get("name"), "size": fi.get("itemSize") or 0})
+        else:
+            title, items = parse(data)
+            walk(items, "", 0)
+    if not entries:
+        f = re.search(r'"typedID":"f_(\d+)"', html or "")
+        if f and st["shared"]:
+            entries.append({"url": direct(f.group(1)), "name": None, "size": 0})
+    ents = _finalize(entries)
+    if not ents:
+        raise RuntimeError("Box: não consegui listar os arquivos (link privado ou expirado?)")
+    if len(entries) >= BOX_MAX_FILES:
+        st["warn"].append(f"parei em {BOX_MAX_FILES} arquivos")
+    return {"title": title or "Box", "entries": ents, "warn": "; ".join(st["warn"]), "note": "Box"}
+
+
+# ---------- SendGB (sendgb.com/CODIGO ou /download/CODIGO) ----------
+SENDGB_API = "https://api.sendgb.com/api/download"
+SENDGB_KEY = re.compile(r"\b([A-Z0-9]{5}(?:-[A-Z0-9]{5}){3}/[^\s\"'<>?#\\]+)")
+
+
+def _sendgb_files(obj, out):
+    """Procura no JSON objetos que pareçam arquivos: {key|path|file_key: 'XXXXX-.../nome', name, size}."""
+    if isinstance(obj, dict):
+        key = next((obj[k] for k in ("key", "file_key", "fileKey", "path", "object_key", "s3_key")
+                    if isinstance(obj.get(k), str) and SENDGB_KEY.fullmatch(obj[k])), None)
+        if key:
+            out.append({"key": key,
+                        "name": obj.get("name") or obj.get("original_name") or obj.get("originalName")
+                        or obj.get("file_name") or obj.get("filename"),
+                        "size": obj.get("size") or obj.get("file_size") or obj.get("fileSize") or 0,
+                        "path": obj.get("relative_path") or obj.get("folder") or ""})
+        for v in obj.values():
+            _sendgb_files(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _sendgb_files(v, out)
+
+
+def sendgb_expand(url: str) -> dict:
+    m = re.search(r"sendgb\.com/(?:[a-z]{2}/)?(?:download/)?([A-Za-z0-9]{6,20})(?:[/?#]|$)", url)
+    if not m:
+        raise RuntimeError("código do SendGB não encontrado no link")
+    code = m.group(1)
+    hdr = {**UA, "Accept": "application/json", "Origin": "https://www.sendgb.com",
+           "Referer": f"https://www.sendgb.com/download/{code}"}
+    found, title, err = [], "", ""
+    for ep in ("", "/files", "/info"):
+        try:
+            r = requests.get(f"{SENDGB_API}/{code}{ep}", headers=hdr, timeout=25)
+            if r.status_code != 200 or "json" not in (r.headers.get("content-type") or ""):
+                err = f"HTTP {r.status_code}"
+                continue
+            j = r.json()
+            _sendgb_files(j, found)
+            d = j.get("data") if isinstance(j, dict) and isinstance(j.get("data"), dict) else j
+            if isinstance(d, dict):
+                title = d.get("subject") or d.get("transfer_name") or d.get("name") or title
+            if found:
+                break
+        except Exception as e:
+            err = str(e)
+    if not found:  # plano B: chaves que aparecem no HTML da página
+        try:
+            html = _get(f"https://www.sendgb.com/download/{code}", timeout=30).text.replace("\\/", "/")
+            for k in dict.fromkeys(SENDGB_KEY.findall(html)):
+                found.append({"key": k, "name": None, "size": 0, "path": ""})
+        except Exception as e:
+            err = str(e)
+    seen, entries = set(), []
+    for f in found:
+        if f["key"] in seen:
+            continue
+        seen.add(f["key"])
+        name = f["name"] or unquote(f["key"].split("/")[-1])
+        entries.append({"url": f"{SENDGB_API}/{code}/presign?key={quote(f['key'], safe='')}",
+                        "presign": True, "name": name, "size": int(f["size"] or 0),
+                        "path": str(f["path"] or "").strip("/"), "headers": hdr})
+    ents = _finalize(entries)
+    if not ents:
+        raise RuntimeError(f"SendGB: não achei a lista de arquivos ({err or 'resposta vazia'}); "
+                           "a transferência pode ter senha ou ter expirado")
+    return {"title": title or f"SendGB {code}", "entries": ents, "warn": "", "note": "SendGB"}
+
+
+def sendgb_presign(e: dict) -> str:
+    """O presign devolve o link assinado do R2 (JSON com url, texto puro ou redirect)."""
+    r = requests.get(e["url"], headers=e.get("headers") or UA, timeout=25, allow_redirects=False)
+    if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
+        return r.headers["location"]
+    r.raise_for_status()
+    t = r.text.strip()
+    try:
+        j = r.json()
+        stack = [j]
+        while stack:
+            o = stack.pop()
+            if isinstance(o, str) and o.startswith("https://"):
+                return o
+            if isinstance(o, dict):
+                for k in ("url", "presigned_url", "presignedUrl", "download_url", "link"):
+                    if isinstance(o.get(k), str) and o[k].startswith("https://"):
+                        return o[k]
+                stack += list(o.values())
+            elif isinstance(o, list):
+                stack += o
+    except ValueError:
+        if t.startswith("https://"):
+            return t.split()[0]
+    raise RuntimeError("SendGB: o presign não devolveu um link")
+
+
+# ---------- imgur.gg (arquivos /f/ID; o JSON da página traz bucketKey e nome) ----------
+def imgurgg_expand(url: str) -> dict:
+    html = _get(url, timeout=30).text
+    txt = html.replace('\\"', '"').replace("\\u0026", "&")
+    entries, seen = [], set()
+    for mk in re.finditer(r'"bucketKey":"([^"]+)"', txt):
+        key = mk.group(1)
+        if key in seen:
+            continue
+        seen.add(key)
+        ctx = txt[max(0, mk.start() - 800): mk.start()]
+        on = re.findall(r'"originalName":"((?:[^"\\]|\\.)*)"', ctx)
+        sz = re.findall(r'"size":(\d+)', ctx)
+        name = (on[-1] if on else key.split("-", 1)[-1])
+        try:
+            name = json.loads(f'"{name}"')
+        except ValueError:
+            pass
+        entries.append({"url": f"https://b.imgur.gg/{quote(key)}?download={quote(name)}", "name": name,
+                        "size": int(sz[-1]) if sz else 0,
+                        "headers": {"Referer": "https://imgur.gg/"}})
+    if not entries:
+        m = re.search(r"/f/([A-Za-z0-9]+)", url)
+        if not m:
+            raise RuntimeError("imgur.gg: não achei o arquivo na página")
+        entries.append({"url": f"https://imgur.gg/api/file/{m.group(1)}/download", "name": None, "size": 0,
+                        "headers": {"Referer": url}})
+    t = re.search(r"<title>(.*?)</title>", html, re.S)
+    title = unescape(t.group(1)).replace(" - imgur.gg", "").strip() if t else "imgur.gg"
+    return {"title": title, "entries": _finalize(entries), "warn": "", "note": "imgur.gg"}
+
+
+def entry_url(e: dict) -> str:
+    """Link final de uma entrada (alguns hosts só assinam o link na hora de baixar)."""
+    if e.get("presign"):
+        return sendgb_presign(e)
+    return e["url"]
+
+
 def expand(url: str) -> dict:
     url = url.strip()
     if not url.startswith(("http://", "https://")):
@@ -793,6 +1012,12 @@ def expand(url: str) -> dict:
             return pixeldrain_list(url)
         if host.endswith(("onedrive.live.com", "1drv.ms")):
             return onedrive_expand(url)
+        if host == "box.com" or host.endswith((".box.com", ".app.box.com")) or host == "app.box.com":
+            return box_expand(url)
+        if host.endswith("sendgb.com"):
+            return sendgb_expand(url)
+        if host == "imgur.gg":
+            return imgurgg_expand(url)
     except Exception as e:  # cai no resolve() simples
         print("expand falhou:", e, file=sys.stderr)
         warn = f"não consegui listar o conteúdo ({e})"
@@ -1159,6 +1384,8 @@ def fetch_job(job, dl_dir: Path) -> Path:
     if job["kind"] == "tg":
         return tg_download(job["file_id"], dl_dir, job.get("name"))
     e = job["entry"]
+    if e.get("presign"):
+        return download_to(entry_url(e), dl_dir, e.get("name"))
     return download_to(e["url"], dl_dir, e.get("name"), e.get("headers"))
 
 
@@ -1212,7 +1439,7 @@ def main():
         elif opts.get("pick") and len(items) == 1 and len(ents) > 1:
             pick_ex = ex
         if len(ents) == 1:
-            say(f"🔍 Resolvido: {ex.get('note')}\n{ents[0]['url'][:200]}")
+            say(f"🔍 Resolvido: {ex.get('note')}\n{ents[0]['name']}")
         else:
             say(f"🔍 {ex.get('title') or 'Link'}: {len(ents)} arquivo(s) ({ex.get('note')})")
         if ex.get("warn"):
@@ -1233,8 +1460,12 @@ def main():
         lines = []
         for j in jobs:
             e = j["entry"]
-            lines.append(f"{e['name']}: {e['url']}")
-            if e.get("headers"):
+            try:
+                link = entry_url(e)
+            except Exception as ex:
+                link = f"(falhou: {ex})"
+            lines.append(f"{e['name']}: {link}")
+            if e.get("headers") and not e.get("presign"):
                 lines.append("   ↳ precisa dos headers: " + "; ".join(f"{k}: {v}" for k, v in e["headers"].items()))
         say_long(["🔗 Links diretos:"] + lines)
         return
