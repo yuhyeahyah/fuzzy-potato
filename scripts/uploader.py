@@ -847,7 +847,15 @@ def box_expand(url: str) -> dict:
         si = data.get("/app-api/enduserapp/shared-item") or {}
         if si.get("itemType") == "file":
             fi = data.get("/app-api/enduserapp/shared-file") or {}
+            for k, v in data.items():
+                if not fi and k.startswith("/app-api/enduserapp/item/") and isinstance(v, dict):
+                    fi = next((x for x in v.get("items") or [] if str(x.get("id")) == str(si["itemID"])), {})
+            if not fi.get("name"):
+                n = (re.search(r'<meta property="og:title" content="([^"]+?)(?: \| Powered by Box)?"', html or "")
+                     or re.search(r"<title>(.*?) \|", html or "", re.S))
+                fi = {"name": unescape(n.group(1)).strip() if n else None, "itemSize": fi.get("itemSize")}
             entries.append({"url": direct(si["itemID"]), "name": fi.get("name"), "size": fi.get("itemSize") or 0})
+            title = fi.get("name") or ""
         else:
             title, items = parse(data)
             walk(items, "", 0)
@@ -1152,10 +1160,177 @@ def wetransfer_link(e: dict) -> str:
     return link
 
 
+def _follow_link(url: str, headers=None) -> str:
+    """Endpoints que respondem com redirect, JSON ou texto contendo o link assinado."""
+    h = dict(UA)
+    h.update(headers or {})
+    r = requests.get(url, headers=h, timeout=30, allow_redirects=False, stream=True)
+    try:
+        if r.is_redirect or r.status_code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("location") or ""
+            return requests.compat.urljoin(url, loc) if loc else url
+        ct = (r.headers.get("content-type") or "").lower()
+        if r.status_code == 200 and ("json" in ct or "text/plain" in ct):
+            body = r.raw.read(65536, decode_content=True).decode("utf-8", "ignore").strip()
+            try:
+                j = json.loads(body)
+            except ValueError:
+                j = None
+            if isinstance(j, list) and j:
+                j = j[0]
+            if isinstance(j, dict):
+                for k in ("url", "g", "link", "download_url", "downloadUrl", "direct_link"):
+                    v = j.get(k) or (j.get("data") or {}).get(k) if isinstance(j.get("data"), dict) else j.get(k)
+                    if isinstance(v, str) and v.startswith("http"):
+                        return v
+            elif body.startswith("http") and len(body) < 4000:
+                return body
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code} ao pedir o link")
+        return url
+    finally:
+        r.close()
+
+
+# ---------- SwissTransfer (/dl/LINK; a página traz um JSON data-page com os arquivos) ----------
+def swisstransfer_expand(url: str) -> dict:
+    html = _get(url, timeout=30).text
+    m = re.search(r'<script[^>]*data-page="app"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        raise RuntimeError("SwissTransfer: não achei os dados da transferência na página")
+    props = json.loads(m.group(1)).get("props") or {}
+    link, tr = props.get("link") or {}, props.get("transfer") or {}
+    lid = link.get("id") or (re.search(r"/dl/([0-9a-f-]{36})", url) or [None, None])[1]
+    if not lid or not tr.get("files"):
+        raise RuntimeError("SwissTransfer: transferência vazia, expirada ou com senha")
+    entries = []
+    for f in tr["files"]:
+        path, _, name = (f.get("path") or f.get("name") or f["id"]).rpartition("/")
+        entries.append({"url": f"https://www.swisstransfer.com/api/1/links/{lid}/files/{f['id']}",
+                        "presign": "follow", "headers": {"Referer": url},
+                        "name": name, "path": path, "size": f.get("size") or 0})
+    return {"title": tr.get("title") or "SwissTransfer", "entries": _finalize(entries), "warn": "",
+            "note": "SwissTransfer"}
+
+
+# ---------- BuzzHeavier (o botão faz hx-get /ID/download?t=...; a resposta traz HX-Redirect) ----------
+def buzzheavier_expand(url: str) -> dict:
+    m = re.search(r"buzzheavier\.com/([A-Za-z0-9]+)", url)
+    if not m:
+        raise RuntimeError("BuzzHeavier: não achei o ID no link")
+    fid = m.group(1)
+    page = f"https://buzzheavier.com/{fid}"
+    html = _get(page, timeout=30).text
+    n = re.search(r'<p class="file-name">(.*?)</p>', html, re.S) or re.search(r"<title>(.*?)</title>", html, re.S)
+    name = unescape(n.group(1)).strip() if n else None
+    sz = re.search(r'class="size">([\d.]+)\s*([KMGT]?B)<', html)
+    size = int(float(sz.group(1)) * 1024 ** "BKMGT".index(sz.group(2)[0])) if sz else 0
+    ents = _finalize([{"url": page + "/download", "presign": "buzzheavier", "bz": fid,
+                       "name": name or fid, "size": size}])
+    return {"title": name or "BuzzHeavier", "entries": ents, "warn": "", "note": "BuzzHeavier"}
+
+
+def buzzheavier_link(e: dict) -> str:
+    page = f"https://buzzheavier.com/{e['bz']}"
+    html = _get(page, timeout=30).text
+    t = re.search(r'hx-get="(/' + re.escape(e["bz"]) + r'/download\?t=[^"&]+)', html)
+    dl = "https://buzzheavier.com" + unescape(t.group(1)) if t else page + "/download"
+    h = dict(UA)
+    h.update({"HX-Request": "true", "HX-Current-URL": page, "Referer": page})
+    r = requests.get(dl, headers=h, timeout=30, allow_redirects=False)
+    loc = r.headers.get("hx-redirect") or r.headers.get("location")
+    if not loc:
+        raise RuntimeError(f"BuzzHeavier não devolveu o link (HTTP {r.status_code}; talvez Cloudflare)")
+    return requests.compat.urljoin(dl, loc)
+
+
+# ---------- transfer.it (MEGA; /t/ID; lista via API cs?x=ID) ----------
+def _b64u(s: str) -> bytes:
+    s = s.replace("-", "+").replace("_", "/").replace(",", "")
+    return base64.b64decode(s + "=" * (-len(s) % 4))
+
+
+def _mega_attr(a: str, k: str):
+    """Decifra o atributo de nome do MEGA (AES-128-CBC, IV zero). None se não der."""
+    if not a:
+        return None
+    raw = None
+    try:
+        raw = _b64u(a)
+        if raw.startswith(b"MEGA{"):
+            return json.loads(raw[4:].rstrip(b"\0").decode()).get("n")
+    except Exception:
+        pass
+    if not k or ":" in k or raw is None:
+        return None
+    try:
+        from Crypto.Cipher import AES  # pycryptodome
+        kb = _b64u(k)
+        if len(kb) == 32:
+            kb = bytes(x ^ y for x, y in zip(kb[:16], kb[16:]))
+        if len(kb) != 16:
+            return None
+        dec = AES.new(kb, AES.MODE_CBC, b"\0" * 16).decrypt(raw[: len(raw) // 16 * 16])
+        if dec.startswith(b"MEGA{"):
+            return json.loads(dec[4:].rstrip(b"\0").decode("utf-8", "ignore")).get("n")
+    except Exception:
+        return None
+    return None
+
+
+def transferit_expand(url: str) -> dict:
+    m = re.search(r"transfer\.it/t/([A-Za-z0-9_-]+)", url)
+    if not m:
+        raise RuntimeError("transfer.it: não achei o ID no link (/t/ID)")
+    xh = m.group(1)
+    r = requests.post(f"https://g.api.mega.co.nz/cs?id={int(time.time())}&x={xh}",
+                      data=json.dumps([{"a": "f", "c": 1, "r": 1}]),
+                      headers={**UA, "Content-Type": "application/json", "Origin": "https://transfer.it"}, timeout=30)
+    j = r.json()
+    if isinstance(j, list):
+        j = j[0]
+    if not isinstance(j, dict) or not j.get("f"):
+        raise RuntimeError(f"transfer.it: a API não listou os arquivos (resposta {str(j)[:80]})")
+    nodes = {n["h"]: n for n in j["f"] if isinstance(n, dict) and n.get("h")}
+    names = {h: _mega_attr(n.get("a"), n.get("k")) for h, n in nodes.items()}
+
+    def path_of(n):
+        parts, p, seen = [], n.get("p"), set()
+        while p in nodes and p not in seen:
+            seen.add(p)
+            if nodes[p].get("p") in nodes:  # a raiz (nome da transferência) fica de fora
+                parts.append(safe_name(names.get(p) or p))
+            p = nodes[p].get("p")
+        return "/".join(reversed(parts))
+
+    entries, unnamed = [], 0
+    for h, n in nodes.items():
+        if n.get("t") != 0:
+            continue
+        name = names.get(h)
+        if not name:
+            unnamed += 1
+        q = f"x={xh}&n={h}" + (f"&fn={quote(name)}" if name else "")
+        entries.append({"url": f"https://g.api.mega.co.nz/cs/g?{q}", "presign": "follow",
+                        "headers": {"Referer": "https://transfer.it/"},
+                        "name": name or f"arquivo_{h}", "server_name": not name,
+                        "path": path_of(n), "size": n.get("s") or 0})
+    if not entries:
+        raise RuntimeError("transfer.it: nenhum arquivo na transferência")
+    root = next((h for h, n in nodes.items() if n.get("t") == 1 and n.get("p") not in nodes), None)
+    warn = f"{unnamed} arquivo(s) sem nome legível; o nome vem do servidor no download" if unnamed else ""
+    return {"title": names.get(root) or "transfer.it", "entries": _finalize(entries), "warn": warn,
+            "note": "transfer.it"}
+
+
 def entry_url(e: dict) -> str:
     """Link final de uma entrada (alguns hosts só assinam o link na hora de baixar)."""
     if e.get("presign") == "wetransfer":
         return wetransfer_link(e)
+    if e.get("presign") == "buzzheavier":
+        return buzzheavier_link(e)
+    if e.get("presign") == "follow":
+        return _follow_link(e["url"], e.get("headers"))
     if e.get("presign"):
         return sendgb_presign(e)
     return e["url"]
@@ -1185,6 +1360,12 @@ def expand(url: str) -> dict:
             return pillows_expand(url)
         if host.endswith(("wetransfer.com", "we.tl")):
             return wetransfer_expand(url)
+        if host.endswith("swisstransfer.com") and "/dl/" in parsed.path:
+            return swisstransfer_expand(url)
+        if host.endswith("buzzheavier.com") and re.match(r"^/[A-Za-z0-9]+/?$", parsed.path):
+            return buzzheavier_expand(url)
+        if host == "transfer.it" and parsed.path.startswith("/t/"):
+            return transferit_expand(url)
     except Exception as e:  # cai no resolve() simples
         print("expand falhou:", e, file=sys.stderr)
         warn = f"não consegui listar o conteúdo ({e})"
@@ -1557,14 +1738,47 @@ def fetch_job(job, dl_dir: Path) -> Path:
         if size > free - 512 * 2**20:
             raise RuntimeError(f"{e.get('name')}: {size / 2**30:.1f} GiB não cabe no disco do runner "
                                f"({free / 2**30:.1f} GiB livres)")
+    hint = None if e.get("server_name") else e.get("name")
+    if e.get("presign") in ("follow", "buzzheavier"):
+        return download_to(entry_url(e), dl_dir, hint, e.get("headers") if e.get("presign") == "follow" else None)
     if e.get("presign"):
-        return download_to(entry_url(e), dl_dir, e.get("name"))
+        return download_to(entry_url(e), dl_dir, hint)
     try:
         return download_to(e["url"], dl_dir, e.get("name"), e.get("headers"))
     except Exception:
         if not e.get("fallback"):
             raise
         return download_to(e["fallback"], dl_dir, e.get("name"), e.get("headers"))
+
+
+def pack_jobs(jobs, dl: Path, tmp: Path, title: str, errors: list):
+    """Baixa um por um e já grava no ZIP (apaga cada arquivo depois): usa pouco disco."""
+    zpath = unique_path(tmp / "pack", safe_name(title) + ".zip")
+    used, n_ok, total = set(), 0, len(jobs)
+    say(f"📦 Modo ZIP: {total} arquivo(s) num único {zpath.name}")
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for n, job in enumerate(jobs, 1):
+            label = job_label(job)
+            path = None
+            try:
+                say(f"⬇️ {n}/{total}: {label}")
+                path = fetch_job(job, dl)
+                sub = (job.get("entry") or {}).get("path") or ""
+                arc = (sub + "/" if sub else "") + path.name
+                base, i = arc, 1
+                while arc in used:
+                    stem, dot, ext = base.rpartition(".")
+                    arc = f"{stem} ({i}).{ext}" if dot else f"{base} ({i})"
+                    i += 1
+                used.add(arc)
+                zf.write(path, arcname=arc)
+                n_ok += 1
+            except Exception as e:
+                errors.append(f"{label}: {e}")
+            finally:
+                if path:
+                    path.unlink(missing_ok=True)
+    return zpath, n_ok
 
 
 def main():
@@ -1598,7 +1812,7 @@ def main():
         + (f" | envio={mode_desc}" if mode_desc else ""))
 
     # ---- 1) resolve: cada item vira um ou mais downloads ----
-    jobs, pick_ex = [], None
+    jobs, pick_ex, pack_title = [], None, None
     for it in items:
         if it.get("file_id"):
             jobs.append({"kind": "tg", "file_id": it["file_id"], "name": it.get("name") or it.get("file_name")})
@@ -1623,6 +1837,8 @@ def main():
         if ex.get("warn"):
             say(f"⚠️ {ex['warn']}")
         jobs += [{"kind": "url", "entry": e} for e in ents]
+        if it.get("zip") and len(ents) > 1:
+            pack_title = pack_title or (ex.get("title") or "arquivos")
     if not jobs:
         raise RuntimeError("Nada para baixar")
 
@@ -1654,7 +1870,18 @@ def main():
         tmp = Path(td)
         dl = tmp / "dl"
 
-        if mode in ("telegram", "upload"):
+        if mode in ("telegram", "upload") and pack_title:
+            zpath, n_ok = pack_jobs(jobs, dl, tmp, pack_title, errors)
+            if n_ok:
+                try:
+                    if mode == "telegram":
+                        deliver(zpath, f"📦 {zpath.name} ({n_ok} arquivo(s))", premium_client, volume_limit)
+                    else:
+                        results.append(f"{zpath.name}: {do_upload(zpath, host)}")
+                    done += 1
+                except Exception as e:
+                    errors.append(f"{zpath.name}: {e}")
+        elif mode in ("telegram", "upload"):
             total = len(jobs)
             for n, job in enumerate(jobs, 1):
                 label = job_label(job)
