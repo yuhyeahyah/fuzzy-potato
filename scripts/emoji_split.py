@@ -31,12 +31,16 @@ def download_image(url):
     return Image.open(io.BytesIO(r.content)).convert("RGBA")
 
 
-def make_emoji_image(im):
+def make_emoji_image(im, fill=False):
     im = im.convert("RGBA")
     bbox = im.getbbox()
     if bbox:
         im = im.crop(bbox)
-    im.thumbnail((100, 100), Image.Resampling.LANCZOS)
+    if fill:
+        # preenche mais o espaço (bom pra capa)
+        im = im.resize((100, 100), Image.Resampling.LANCZOS)
+    else:
+        im.thumbnail((100, 100), Image.Resampling.LANCZOS)
     canvas = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
     x = (100 - im.width) // 2
     y = (100 - im.height) // 2
@@ -44,27 +48,26 @@ def make_emoji_image(im):
     return canvas
 
 
-def split_logo(im, max_parts=7):
+def split_logo(im, max_parts=8):
     im = im.convert("RGBA")
     bbox = im.getbbox()
     if bbox:
         im = im.crop(bbox)
     w, h = im.size
-    if w < 120:
+    if w < 100:
         return [im]
-    parts = max(3, min(max_parts, w // 70))
+    parts = max(4, min(max_parts, w // 55))
     slice_w = w // parts
     tiles = []
     for i in range(parts):
         left = i * slice_w
         right = w if i == parts - 1 else (i + 1) * slice_w
-        tile = im.crop((left, 0, right, h))
-        tiles.append(tile)
+        tiles.append(im.crop((left, 0, right, h)))
     return tiles
 
 
-def upload_emoji(im, set_name, owner_id, emoji="⭐"):
-    im = make_emoji_image(im)
+def upload_emoji(im, set_name, owner_id, emoji="⭐", fill=False):
+    im = make_emoji_image(im, fill=fill)
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
         im.save(tmp, format="PNG")
         tmp_path = tmp.name
@@ -113,7 +116,7 @@ def main():
 
     if cover_url:
         im = download_image(cover_url)
-        result["cover_id"] = upload_emoji(im, set_name, owner_id, "🖼")
+        result["cover_id"] = upload_emoji(im, set_name, owner_id, "🖼", fill=True)
 
     if callback:
         requests.post(callback["url"], json={"token": callback["token"], "result": result}, timeout=20)
