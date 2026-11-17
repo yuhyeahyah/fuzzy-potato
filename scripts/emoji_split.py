@@ -40,36 +40,44 @@ def trim(im):
     return im.crop(bbox) if bbox else im
 
 
-def split_logo(im, max_parts=8):
+def split_logo(im, max_parts=6):
     im = trim(im)
     w, h = im.size
-    if w < 90:
-        return [im]
-    parts = max(2, min(max_parts, w // 65))
-    slice_w = w // parts
+    if w < 50 or h < 20:
+        return [im.resize((100, 100), Image.Resampling.LANCZOS)]
+    parts = max(2, min(max_parts, w // 80))
+    slice_w = max(40, w // parts)
     tiles = []
     for i in range(parts):
         left = i * slice_w
-        right = w if i == parts - 1 else (i + 1) * slice_w
+        right = min(w, left + slice_w)
+        if right - left < 20:
+            continue
         tile = im.crop((left, 0, right, h))
-        tile.thumbnail((100, 100), Image.Resampling.LANCZOS)
-        canvas = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
-        canvas.paste(tile, ((100 - tile.width) // 2, (100 - tile.height) // 2), tile)
-        tiles.append(canvas)
-    return tiles
+        tile = tile.resize((100, 100), Image.Resampling.LANCZOS)
+        # fundo escuro pra garantir que não fique vazio
+        bg = Image.new("RGBA", (100, 100), (25, 25, 25, 255))
+        bg.paste(tile, (0, 0), tile)
+        tiles.append(bg)
+    return tiles or [im.resize((100, 100), Image.Resampling.LANCZOS)]
 
 
 def make_cover(im):
     im = trim(im)
-    im.thumbnail((100, 100), Image.Resampling.LANCZOS)
-    canvas = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
-    canvas.paste(im, ((100 - im.width) // 2, (100 - im.height) // 2), im)
-    return canvas
+    im = im.resize((100, 100), Image.Resampling.LANCZOS)
+    bg = Image.new("RGBA", (100, 100), (25, 25, 25, 255))
+    bg.paste(im, (0, 0), im)
+    return bg
 
 
 def upload_emoji(im, set_name, owner_id, emoji="⭐"):
+    if im.size[0] < 10 or im.size[1] < 10:
+        im = im.resize((100, 100), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
     im.save(buf, format="PNG")
+    data_bytes = buf.getvalue()
+    if len(data_bytes) < 80:
+        raise RuntimeError("imagem gerada está vazia")
     buf.seek(0)
     files = {"png_sticker": ("e.png", buf, "image/png")}
     data = {
