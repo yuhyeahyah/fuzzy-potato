@@ -50,6 +50,14 @@ UA = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
+# cabeçalhos de navegador (hosts atrás de Cloudflare recusam o UA "pelado" do requests)
+BROWSER = {
+    **UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 # ---------------------------------------------------------------------------
 # Telegram helpers
@@ -318,10 +326,15 @@ def resolve(url: str) -> dict:
 
     # ---------- PixelDrain ----------
     if any(host.endswith(d) for d in ("pixeldrain.com", "pixeldrain.net", "pixeldrain.dev", "pixeldra.in")):
-        m = re.search(r"/u/([A-Za-z0-9]+)", url)
+        m = re.search(r"/(?:u|api/file)/([A-Za-z0-9]+)", url)
         if m:
+            name = None
+            try:  # o nome real vem do /info (o ?download sozinho nomeava o arquivo com o ID)
+                name = (_get(f"https://pixeldrain.com/api/file/{m.group(1)}/info").json() or {}).get("name")
+            except Exception:
+                pass
             return {"url": f"https://pixeldrain.com/api/file/{m.group(1)}?download",
-                    "name": None, "note": "PixelDrain"}
+                    "name": name, "note": "PixelDrain"}
 
     # ---------- GoFile ----------
     if "gofile.io" in host:
@@ -361,8 +374,30 @@ def resolve(url: str) -> dict:
     if any(x in host for x in ("drive.google.com", "docs.google.com", "drive.usercontent.google.com")):
         m = re.search(r"/d/([A-Za-z0-9_-]+)", url) or re.search(r"[?&]id=([A-Za-z0-9_-]+)", url)
         if m:
-            return {"url": f"https://drive.google.com/uc?export=download&confirm=t&id={m.group(1)}",
-                    "name": None, "note": "Google Drive"}
+            fid = m.group(1)
+            base = f"https://drive.usercontent.google.com/download?id={fid}&export=download"
+            sess = requests.Session()
+            sess.headers.update(UA)
+            name = None
+            try:
+                r = sess.get(base, timeout=30)
+                ct = (r.headers.get("content-type") or "").lower()
+                if not ct.startswith("text/html"):  # arquivo pequeno: já veio o download
+                    cd = r.headers.get("content-disposition", "")
+                    mm = re.search(r"filename\*?=(?:UTF-8\'\')?\"?([^\";]+)", cd)
+                    return {"url": base, "name": unquote(mm.group(1)) if mm else None, "note": "Google Drive"}
+                # página de aviso de vírus: tem um <form> com confirm/uuid
+                form = re.search(r'<form[^>]+id="download-form"[^>]+action="([^"]+)"(.*?)</form>', r.text, re.S)
+                nm = re.search(r'<span class="uc-name-size"><a[^>]*>([^<]+)</a>', r.text)
+                name = unescape(nm.group(1)) if nm else None
+                if form:
+                    action = unescape(form.group(1))
+                    fields = dict(re.findall(r'name="([^"]+)"\s+value="([^"]*)"', form.group(2)))
+                    q = "&".join(f"{k}={quote(v)}" for k, v in fields.items())
+                    return {"url": f"{action}?{q}" if q else action, "name": name, "note": "Google Drive"}
+            except Exception as e:
+                print("gdrive:", e, file=sys.stderr)
+            return {"url": f"{base}&confirm=t", "name": name, "note": "Google Drive"}
 
     # ---------- Filebin ----------
     if "filebin.net" in host:
@@ -524,9 +559,12 @@ def resolve(url: str) -> dict:
         except Exception as e:
             return {"url": url, "name": None, "note": f"OSDN ({e})"}
 
-    # ---------- send.now ----------
-    if host == "send.now" or host.endswith(".send.now"):
-        return {"url": url, "name": None, "note": "send.now (sem endpoint conhecido)"}
+    # ---------- send.now (XFileSharing: a página tem um form op=download2) ----------
+    if host == "send.now" or host.endswith((".send.now", ".send.cm")):
+        try:
+            return sendnow_resolve(url)
+        except Exception as e:
+            return {"url": url, "name": None, "note": f"send.now ({e})"}
 
     # ---------- SourceForge ----------
     if "sourceforge.net" in host:
@@ -1220,7 +1258,7 @@ def buzzheavier_expand(url: str) -> dict:
         raise RuntimeError("BuzzHeavier: não achei o ID no link")
     fid = m.group(1)
     page = f"https://buzzheavier.com/{fid}"
-    html = _get(page, timeout=30).text
+    html = _get(page, timeout=30, headers={**BROWSER, "Referer": "https://buzzheavier.com/"}).text
     n = re.search(r'<p class="file-name">(.*?)</p>', html, re.S) or re.search(r"<title>(.*?)</title>", html, re.S)
     name = unescape(n.group(1)).strip() if n else None
     sz = re.search(r'class="size">([\d.]+)\s*([KMGT]?B)<', html)
@@ -1232,7 +1270,7 @@ def buzzheavier_expand(url: str) -> dict:
 
 def buzzheavier_link(e: dict) -> str:
     page = f"https://buzzheavier.com/{e['bz']}"
-    html = _get(page, timeout=30).text
+    html = _get(page, timeout=30, headers={**BROWSER, "Referer": "https://buzzheavier.com/"}).text
     t = re.search(r'hx-get="(/' + re.escape(e["bz"]) + r'/download\?t=[^"&]+)', html)
     dl = "https://buzzheavier.com" + unescape(t.group(1)) if t else page + "/download"
     h = dict(UA)
@@ -1323,6 +1361,170 @@ def transferit_expand(url: str) -> dict:
             "note": "transfer.it"}
 
 
+def pixeldrain_file(url: str) -> dict:
+    m = re.search(r"/(?:u|api/file)/([A-Za-z0-9]+)", url)
+    if not m:
+        raise RuntimeError("PixelDrain: id não encontrado")
+    info = {}
+    try:
+        info = _get(f"https://pixeldrain.com/api/file/{m.group(1)}/info").json() or {}
+    except Exception:
+        pass
+    ents = _finalize([{"url": f"https://pixeldrain.com/api/file/{m.group(1)}?download",
+                       "name": info.get("name"), "size": info.get("size") or 0}])
+    return {"title": info.get("name") or "PixelDrain", "entries": ents, "warn": "", "note": "PixelDrain"}
+
+
+# ---------- send.now / send.cm (XFileSharing: form op=download2 -> link em usercdn/usercontent) ----------
+def sendnow_resolve(url: str) -> dict:
+    s = requests.Session()
+    s.headers.update(BROWSER)
+    html = s.get(url, timeout=30).text
+    fid = (re.search(r'name="id"\s+value="([^"]+)"', html) or [None, None])[1]
+    name = (re.search(r'feather feather-file[^>]*></svg>\s*([^<]+?)\s*</h6>', html)
+            or re.search(r'<h6[^>]*>[^<]*?([^<>\n]+\.[A-Za-z0-9]{1,8})\s*</h6>', html)
+            or re.search(r"<title>([^<]+)</title>", html))
+    name = unescape(name.group(1)).strip() if name else None
+    if not fid:
+        raise RuntimeError("não achei o formulário de download")
+    fields = {"op": "download2", "id": fid,
+              "rand": (re.search(r'name="rand"\s+value="([^"]*)"', html) or [None, ""])[1],
+              "referer": url, "method_free": "", "method_premium": "", "down_direct": "1"}
+    r = s.post(url, data=fields, headers={**BROWSER, "Referer": url,
+               "Content-Type": "application/x-www-form-urlencoded"},
+               allow_redirects=False, timeout=60)
+    link = r.headers.get("location")
+    if not link:
+        body = r.text
+        mm = (re.search(r'href="(https?://[^"]*(?:usercdn|usercontent|userstorage|/d/)[^"]+)"', body)
+              or re.search(r'(https?://[a-z0-9.\-]*usercdn\.com/[^\s"\'<>]+)', body)
+              or re.search(r'id="direct_link"[^>]*value="([^"]+)"', body))
+        link = unescape(mm.group(1)) if mm else None
+        wait = re.search(r"(?:wait|aguarde)[^0-9]{0,40}(\d+)\s*(?:second|segundo)", body, re.I)
+        if not link and wait:
+            raise RuntimeError(f"tem contador de {wait.group(1)}s na página (conta grátis)")
+    if not link:
+        raise RuntimeError("o servidor não devolveu o link direto (pode exigir espera/conta)")
+    ents = _finalize([{"url": link, "name": name, "headers": {"Referer": url}, "size": 0}])
+    return {"title": name or "send.now", "entries": ents, "warn": "", "note": "send.now"}
+
+
+# ---------- MEGA (mega.nz / mega.io: file e folder, com descriptografia) ----------
+def _mega_cs(params, data, node=None):
+    q = f"https://g.api.mega.co.nz/cs?id={int(time.time())}{params}"
+    r = requests.post(q, data=json.dumps(data),
+                      headers={**UA, "Content-Type": "application/json", "Origin": "https://mega.nz"}, timeout=60)
+    j = r.json()
+    if isinstance(j, int):
+        raise RuntimeError(f"a API do MEGA recusou (código {j})")
+    return j[0] if isinstance(j, list) else j
+
+
+def _mega_filekey(k32: bytes):
+    """key(32B) -> (aes16, nonce8). Para pasta, 16B já é a chave AES (nonce zero)."""
+    if len(k32) == 16:
+        return k32, b"\0" * 8
+    import struct
+    u = struct.unpack(">8I", k32)
+    aes = struct.pack(">4I", u[0] ^ u[4], u[1] ^ u[5], u[2] ^ u[6], u[3] ^ u[7])
+    return aes, k32[16:24]
+
+
+def _mega_name(attr_b64: str, aes16: bytes):
+    try:
+        from Crypto.Cipher import AES
+        raw = _b64u(attr_b64)
+        dec = AES.new(aes16, AES.MODE_CBC, b"\0" * 16).decrypt(raw[: len(raw) // 16 * 16])
+        if dec.startswith(b"MEGA{"):
+            return json.loads(dec[4:].rstrip(b"\0").decode("utf-8", "ignore")).get("n")
+    except Exception:
+        pass
+    return None
+
+
+def mega_expand(url: str) -> dict:
+    frag = url.split("#", 1)
+    body = frag[1] if len(frag) > 1 else ""
+    mf = re.search(r"/(?:file|fm)/([A-Za-z0-9]+)", url) or re.search(r"!([A-Za-z0-9]+)!", url)
+    mfo = re.search(r"/folder/([A-Za-z0-9]+)", url)
+    if mf and not mfo:  # arquivo único
+        handle = mf.group(1)
+        keyb = body.split("!")[-1] if "!" in body else body
+        g = _mega_cs("", [{"a": "g", "g": 1, "p": handle}])
+        aes, nonce = _mega_filekey(_b64u(keyb)) if keyb else (None, None)
+        name = _mega_name(g.get("at"), aes) if aes else None
+        ents = _finalize([{"url": g["g"], "presign": "mega", "mega_key": keyb,
+                           "name": name, "server_name": not name, "size": g.get("s") or 0}])
+        return {"title": name or "MEGA", "entries": ents, "warn": "" if keyb else "link sem chave (#): não dá para decifrar",
+                "note": "MEGA"}
+    if not mfo:
+        raise RuntimeError("MEGA: use um link /file/… ou /folder/…")
+    fh = mfo.group(1)
+    fkey = _b64u((body.split("/")[0] if body else "").split("!")[-1])
+    if len(fkey) != 16:
+        raise RuntimeError("MEGA: link de pasta sem chave válida")
+    from Crypto.Cipher import AES
+    res = _mega_cs(f"&n={fh}", [{"a": "f", "c": 1, "r": 1, "ca": 1}])
+    nodes = {n["h"]: n for n in res.get("f") or [] if isinstance(n, dict) and n.get("h")}
+    names, keys = {}, {}
+    for h, n in nodes.items():
+        kf = (n.get("k") or "")
+        enc = kf.split(":")[-1] if ":" in kf else kf
+        try:
+            raw = AES.new(fkey, AES.MODE_ECB).decrypt(_b64u(enc)) if enc else b""
+        except Exception:
+            raw = b""
+        aes = _mega_filekey(raw)[0] if raw else None
+        keys[h] = enc
+        names[h] = _mega_name(n.get("a"), aes) if aes else None
+
+    def path_of(n):
+        parts, p, seen = [], n.get("p"), set()
+        while p in nodes and p not in seen:
+            seen.add(p)
+            if nodes[p].get("p") in nodes:
+                parts.append(safe_name(names.get(p) or p))
+            p = nodes[p].get("p")
+        return "/".join(reversed(parts))
+
+    entries, unnamed = [], 0
+    for h, n in nodes.items():
+        if n.get("t") != 0:
+            continue
+        g = _mega_cs(f"&n={fh}", [{"a": "g", "g": 1, "n": h}])
+        if not isinstance(g, dict) or not g.get("g"):
+            continue
+        nm = names.get(h)
+        if not nm:
+            unnamed += 1
+        entries.append({"url": g["g"], "presign": "mega", "mega_key": keys.get(h),
+                        "name": nm or f"arquivo_{h}", "server_name": not nm,
+                        "path": path_of(n), "size": g.get("s") or n.get("s") or 0})
+    if not entries:
+        raise RuntimeError("MEGA: pasta vazia ou sem arquivos acessíveis")
+    root = next((h for h, n in nodes.items() if n.get("t") == 1 and n.get("p") not in nodes), None)
+    warn = f"{unnamed} arquivo(s) sem nome legível" if unnamed else ""
+    return {"title": names.get(root) or "MEGA", "entries": _finalize(entries), "warn": warn, "note": "MEGA"}
+
+
+def mega_download(e: dict, dest: Path) -> Path:
+    """Baixa um arquivo do MEGA e decifra em streaming (AES-CTR)."""
+    from Crypto.Cipher import AES
+    from Crypto.Util import Counter
+    aes, nonce = _mega_filekey(_b64u(e["mega_key"]))
+    ctr = Counter.new(64, prefix=nonce, initial_value=0)
+    cipher = AES.new(aes, AES.MODE_CTR, counter=ctr)
+    dest.mkdir(parents=True, exist_ok=True)
+    final = unique_path(dest, e.get("name") or "arquivo")
+    with requests.get(e["url"], headers=UA, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with final.open("wb") as f:
+            for chunk in r.iter_content(1024 * 256):
+                if chunk:
+                    f.write(cipher.decrypt(chunk))
+    return final
+
+
 def entry_url(e: dict) -> str:
     """Link final de uma entrada (alguns hosts só assinam o link na hora de baixar)."""
     if e.get("presign") == "wetransfer":
@@ -1348,6 +1550,8 @@ def expand(url: str) -> dict:
             return gofile_expand(url)
         if host.endswith(("pixeldrain.com", "pixeldrain.net", "pixeldrain.dev", "pixeldra.in")) and "/l/" in parsed.path:
             return pixeldrain_list(url)
+        if host.endswith(("pixeldrain.com", "pixeldrain.net", "pixeldrain.dev", "pixeldra.in")) and re.search(r"/(?:u|api/file)/", parsed.path):
+            return pixeldrain_file(url)
         if host.endswith(("onedrive.live.com", "1drv.ms")):
             return onedrive_expand(url)
         if host == "box.com" or host.endswith((".box.com", ".app.box.com")) or host == "app.box.com":
@@ -1366,6 +1570,10 @@ def expand(url: str) -> dict:
             return buzzheavier_expand(url)
         if host == "transfer.it" and parsed.path.startswith("/t/"):
             return transferit_expand(url)
+        if host.endswith(("mega.nz", "mega.io", "mega.co.nz")):
+            return mega_expand(url)
+        if host == "send.now" or host.endswith((".send.now", ".send.cm")):
+            return sendnow_resolve(url)
     except Exception as e:  # cai no resolve() simples
         print("expand falhou:", e, file=sys.stderr)
         warn = f"não consegui listar o conteúdo ({e})"
@@ -1739,6 +1947,8 @@ def fetch_job(job, dl_dir: Path) -> Path:
             raise RuntimeError(f"{e.get('name')}: {size / 2**30:.1f} GiB não cabe no disco do runner "
                                f"({free / 2**30:.1f} GiB livres)")
     hint = None if e.get("server_name") else e.get("name")
+    if e.get("presign") == "mega":
+        return mega_download(e, dl_dir)
     if e.get("presign") in ("follow", "buzzheavier"):
         return download_to(entry_url(e), dl_dir, hint, e.get("headers") if e.get("presign") == "follow" else None)
     if e.get("presign"):
