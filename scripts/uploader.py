@@ -2206,7 +2206,9 @@ def main():
         if not done:
             raise RuntimeError("nada foi enviado" + (f": {errors[0]}" if errors else ""))
         say("✅ /uploader concluído." + (f" ({len(errors)} com erro)" if errors else ""))
-\n\nif __name__ == "__main__":
+
+
+if __name__ == "__main__":
     try:
         main()
     except Exception as e:
