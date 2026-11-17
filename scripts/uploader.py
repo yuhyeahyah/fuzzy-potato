@@ -2097,11 +2097,11 @@ def main():
         if ex.get("warn"):
             say(f"⚠️ {ex['warn']}")
         jobs += [{"kind": "url", "entry": e} for e in ents]
-      custom_path = (it.get("path") or "").strip().strip("/")
-if custom_path:
-    for j in jobs[-len(ents):]:
-        if j.get("kind") == "url":
-            j["entry"]["path"] = custom_path
+        custom_path = (it.get("path") or "").strip().strip("/")
+        if custom_path:
+            for j in jobs[-len(ents):]:
+                if j.get("kind") == "url":
+                    j["entry"]["path"] = custom_path
         if it.get("zip") and len(ents) > 1:
             pack_title = pack_title or (ex.get("title") or "arquivos")
     if not jobs:
