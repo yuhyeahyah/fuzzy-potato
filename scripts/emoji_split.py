@@ -3,6 +3,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 
 import requests
 from PIL import Image
@@ -12,8 +13,8 @@ PAYLOAD = json.loads(os.environ["PAYLOAD"])
 TG = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
-def tg(method, **kwargs):
-    r = requests.post(f"{TG}/{method}", **kwargs, timeout=60)
+def tg(method, data=None, files=None):
+    r = requests.post(f"{TG}/{method}", data=data, files=files, timeout=60)
     return r.json()
 
 
@@ -31,15 +32,11 @@ def download_image(url):
 
 
 def make_emoji_image(im):
-    """Redimensiona pra 100x100 mantendo transparência e garantindo conteúdo."""
     im = im.convert("RGBA")
-    # corta bordas totalmente transparentes
     bbox = im.getbbox()
     if bbox:
         im = im.crop(bbox)
-    # redimensiona mantendo proporção
     im.thumbnail((100, 100), Image.Resampling.LANCZOS)
-    # canvas transparente 100x100
     canvas = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
     x = (100 - im.width) // 2
     y = (100 - im.height) // 2
@@ -49,28 +46,35 @@ def make_emoji_image(im):
 
 def upload_emoji(im, set_name, owner_id, emoji="⭐"):
     im = make_emoji_image(im)
-    buf = io.BytesIO()
-    im.save(buf, format="PNG")
-    raw = buf.getvalue()
-    if len(raw) < 150:
-        raise RuntimeError(f"PNG muito pequeno ({len(raw)} bytes)")
-    buf.seek(0)
 
-    files = {"png_sticker": ("emoji.png", buf, "image/png")}
-    data = {
-        "user_id": str(owner_id),
-        "name": set_name,
-        "title": "Era Logos",
-        "sticker_type": "custom_emoji",
-        "emojis": emoji,
-    }
-    r = tg("addStickerToSet", data=data, files=files)
-    if not r.get("ok"):
-        r = tg("createNewStickerSet", data=data, files=files)
-    if not r.get("ok"):
-        raise RuntimeError(r.get("description", "falha emoji"))
+    # salva em arquivo temporário (mais confiável pro Telegram)
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        im.save(tmp, format="PNG")
+        tmp_path = tmp.name
 
-    info = tg("getStickerSet", json={"name": set_name})
+    try:
+        with open(tmp_path, "rb") as f:
+            files = {"png_sticker": ("emoji.png", f, "image/png")}
+            data = {
+                "user_id": str(owner_id),
+                "name": set_name,
+                "title": "Era Logos",
+                "sticker_type": "custom_emoji",
+                "emojis": emoji,
+            }
+            r = tg("addStickerToSet", data=data, files=files)
+            if not r.get("ok"):
+                # reabre o arquivo pro create
+                f.seek(0)
+                r = tg("createNewStickerSet", data=data, files=files)
+            if not r.get("ok"):
+                raise RuntimeError(r.get("description", "falha emoji") + " | raw: " + str(r))
+    finally:
+        os.unlink(tmp_path)
+
+    info = tg("getStickerSet", data={"name": set_name})
+    if not info.get("ok"):
+        raise RuntimeError("não consegui ler o set depois de criar")
     return info["result"]["stickers"][-1]["custom_emoji_id"]
 
 
