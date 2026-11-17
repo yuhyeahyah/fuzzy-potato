@@ -1,0 +1,20 @@
+name: emoji-split
+on:
+  repository_dispatch:
+    types: [emoji-split]
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pillow requests
+      - name: Gera custom emojis
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: python scripts/emoji_split.py
