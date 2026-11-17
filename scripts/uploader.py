@@ -374,30 +374,8 @@ def resolve(url: str) -> dict:
     if any(x in host for x in ("drive.google.com", "docs.google.com", "drive.usercontent.google.com")):
         m = re.search(r"/d/([A-Za-z0-9_-]+)", url) or re.search(r"[?&]id=([A-Za-z0-9_-]+)", url)
         if m:
-            fid = m.group(1)
-            base = f"https://drive.usercontent.google.com/download?id={fid}&export=download"
-            sess = requests.Session()
-            sess.headers.update(UA)
-            name = None
-            try:
-                r = sess.get(base, timeout=30)
-                ct = (r.headers.get("content-type") or "").lower()
-                if not ct.startswith("text/html"):  # arquivo pequeno: já veio o download
-                    cd = r.headers.get("content-disposition", "")
-                    mm = re.search(r"filename\*?=(?:UTF-8\'\')?\"?([^\";]+)", cd)
-                    return {"url": base, "name": unquote(mm.group(1)) if mm else None, "note": "Google Drive"}
-                # página de aviso de vírus: tem um <form> com confirm/uuid
-                form = re.search(r'<form[^>]+id="download-form"[^>]+action="([^"]+)"(.*?)</form>', r.text, re.S)
-                nm = re.search(r'<span class="uc-name-size"><a[^>]*>([^<]+)</a>', r.text)
-                name = unescape(nm.group(1)) if nm else None
-                if form:
-                    action = unescape(form.group(1))
-                    fields = dict(re.findall(r'name="([^"]+)"\s+value="([^"]*)"', form.group(2)))
-                    q = "&".join(f"{k}={quote(v)}" for k, v in fields.items())
-                    return {"url": f"{action}?{q}" if q else action, "name": name, "note": "Google Drive"}
-            except Exception as e:
-                print("gdrive:", e, file=sys.stderr)
-            return {"url": f"{base}&confirm=t", "name": name, "note": "Google Drive"}
+            link, name = gdrive_resolve(m.group(1))
+            return {"url": link, "name": name, "note": "Google Drive"}
 
     # ---------- Filebin ----------
     if "filebin.net" in host:
@@ -514,6 +492,12 @@ def resolve(url: str) -> dict:
 
     # ---------- Dropbox ----------
     if "dropbox.com" in host:
+        folder = bool(re.search(r"/(?:scl/fo|sh)/", parsed.path)) and "/file/" not in parsed.path
+        if folder:
+            u = url.split("#")[0].replace("dl=0", "dl=1")
+            if "dl=1" not in u:
+                u += ("&" if "?" in u else "?") + "dl=1"
+            return {"url": u, "name": None, "server_name": True, "note": "Dropbox (pasta → zip)"}
         if "?" in url:
             return {"url": url.replace("?dl=0", "?dl=1").split("&")[0] + ("&dl=1" if "dl=1" not in url else ""),
                     "name": None, "note": "Dropbox"}
@@ -1525,8 +1509,69 @@ def mega_download(e: dict, dest: Path) -> Path:
     return final
 
 
+# ---------- Google Drive (arquivo e pasta) ----------
+def gdrive_resolve(fid: str):
+    """Devolve (link_direto, nome). Trata a página de aviso de vírus dos arquivos grandes."""
+    base = f"https://drive.usercontent.google.com/download?id={fid}&export=download"
+    s = requests.Session()
+    s.headers.update(UA)
+    name = None
+    try:
+        r = s.get(base, timeout=30)
+        ct = (r.headers.get("content-type") or "").lower()
+        if not ct.startswith("text/html"):  # arquivo pequeno: o download já veio
+            cd = r.headers.get("content-disposition", "")
+            mm = re.search(r"filename\*?=(?:UTF-8\'\')?\"?([^\";]+)", cd)
+            return base, (unquote(mm.group(1)) if mm else None)
+        form = re.search(r'<form[^>]+id="download-form"[^>]+action="([^"]+)"(.*?)</form>', r.text, re.S)
+        nm = re.search(r'<span class="uc-name-size"><a[^>]*>([^<]+)</a>', r.text)
+        name = unescape(nm.group(1)) if nm else None
+        if form:
+            action = unescape(form.group(1))
+            fields = dict(re.findall(r'name="([^"]+)"\s+value="([^"]*)"', form.group(2)))
+            q = "&".join(f"{k}={quote(v)}" for k, v in fields.items())
+            return (f"{action}?{q}" if q else action), name
+    except Exception as e:
+        print("gdrive:", e, file=sys.stderr)
+    return f"{base}&confirm=t", name
+
+
+GD_FOLDER = "application/vnd.google-apps.folder"
+
+
+def gdrive_folder_expand(url: str) -> dict:
+    m = re.search(r"/folders/([A-Za-z0-9_-]+)", url)
+    if not m:
+        raise RuntimeError("Google Drive: id da pasta não encontrado")
+    html = _get(f"https://drive.google.com/drive/folders/{m.group(1)}", timeout=30).text
+    iv = re.search(r"_DRIVE_ivd'\]\s*=\s*'((?:\\x[0-9a-fA-F]{2}|\\.|[^'\\])*)'", html)
+    if not iv:
+        raise RuntimeError("Google Drive: não achei a lista da pasta (precisa estar pública / 'qualquer um com o link')")
+    data = json.loads(iv.group(1).encode().decode("unicode_escape"))
+    rows = data[0] if isinstance(data, list) and data and isinstance(data[0], list) else []
+    entries, folders = [], 0
+    for e in rows:
+        if not isinstance(e, list) or len(e) < 4 or not isinstance(e[0], str):
+            continue
+        fid, name, mime = e[0], e[2], e[3]
+        if mime == GD_FOLDER:
+            folders += 1
+            continue
+        size = e[13] if len(e) > 13 and isinstance(e[13], int) else 0
+        entries.append({"url": f"https://drive.usercontent.google.com/download?id={fid}&export=download",
+                        "presign": "gdrive", "gid": fid, "name": name, "size": size})
+    if not entries:
+        raise RuntimeError("Google Drive: a pasta não tem arquivos (ou só tem subpastas)")
+    title = re.search(r'<title>([^<]+?)(?: - Google Drive)?</title>', html)
+    warn = f"{folders} subpasta(s) não foram abertas (só os arquivos da raiz)" if folders else ""
+    return {"title": unescape(title.group(1)).strip() if title else "Google Drive",
+            "entries": _finalize(entries), "warn": warn, "note": "Google Drive (pasta)"}
+
+
 def entry_url(e: dict) -> str:
     """Link final de uma entrada (alguns hosts só assinam o link na hora de baixar)."""
+    if e.get("presign") == "gdrive":
+        return gdrive_resolve(e["gid"])[0]
     if e.get("presign") == "wetransfer":
         return wetransfer_link(e)
     if e.get("presign") == "buzzheavier":
@@ -1572,13 +1617,16 @@ def expand(url: str) -> dict:
             return transferit_expand(url)
         if host.endswith(("mega.nz", "mega.io", "mega.co.nz")):
             return mega_expand(url)
+        if host.endswith("google.com") and "/folders/" in parsed.path:
+            return gdrive_folder_expand(url)
         if host == "send.now" or host.endswith((".send.now", ".send.cm")):
             return sendnow_resolve(url)
     except Exception as e:  # cai no resolve() simples
         print("expand falhou:", e, file=sys.stderr)
         warn = f"não consegui listar o conteúdo ({e})"
     r = resolve(url)
-    ents = _finalize([{"url": r["url"], "name": r.get("name"), "size": 0}])
+    ents = _finalize([{"url": r["url"], "name": r.get("name"), "size": 0,
+                       "server_name": r.get("server_name")}])
     return {"title": host, "entries": ents, "warn": warn, "note": r.get("note") or ""}
 
 
@@ -1949,16 +1997,18 @@ def fetch_job(job, dl_dir: Path) -> Path:
     hint = None if e.get("server_name") else e.get("name")
     if e.get("presign") == "mega":
         return mega_download(e, dl_dir)
+    if e.get("presign") == "gdrive":
+        return download_to(entry_url(e), dl_dir, hint)
     if e.get("presign") in ("follow", "buzzheavier"):
         return download_to(entry_url(e), dl_dir, hint, e.get("headers") if e.get("presign") == "follow" else None)
     if e.get("presign"):
         return download_to(entry_url(e), dl_dir, hint)
     try:
-        return download_to(e["url"], dl_dir, e.get("name"), e.get("headers"))
+        return download_to(e["url"], dl_dir, hint, e.get("headers"))
     except Exception:
         if not e.get("fallback"):
             raise
-        return download_to(e["fallback"], dl_dir, e.get("name"), e.get("headers"))
+        return download_to(e["fallback"], dl_dir, hint, e.get("headers"))
 
 
 def pack_jobs(jobs, dl: Path, tmp: Path, title: str, errors: list):
