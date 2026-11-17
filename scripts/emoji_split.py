@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Corta o logo da era em faixas e sobe cada uma como custom emoji.
-Capa = 1 emoji só.
-Devolve os IDs pro Worker.
-"""
 import io
 import json
 import os
@@ -25,7 +20,7 @@ def tg(method, **kwargs):
 def get_bot_username():
     r = tg("getMe")
     if not r.get("ok"):
-        raise RuntimeError("getMe falhou: " + str(r))
+        raise RuntimeError("getMe falhou")
     return r["result"]["username"]
 
 
@@ -35,53 +30,35 @@ def download_image(url):
     return Image.open(io.BytesIO(r.content)).convert("RGBA")
 
 
-def trim(im):
+def make_emoji_image(im):
+    """Redimensiona pra 100x100 mantendo transparência e garantindo conteúdo."""
+    im = im.convert("RGBA")
+    # corta bordas totalmente transparentes
     bbox = im.getbbox()
-    return im.crop(bbox) if bbox else im
-
-
-def split_logo(im, max_parts=6):
-    im = trim(im)
-    w, h = im.size
-    if w < 50 or h < 20:
-        return [im.resize((100, 100), Image.Resampling.LANCZOS)]
-    parts = max(2, min(max_parts, w // 80))
-    slice_w = max(40, w // parts)
-    tiles = []
-    for i in range(parts):
-        left = i * slice_w
-        right = min(w, left + slice_w)
-        if right - left < 20:
-            continue
-        tile = im.crop((left, 0, right, h))
-        tile = tile.resize((100, 100), Image.Resampling.LANCZOS)
-        # fundo escuro pra garantir que não fique vazio
-        bg = Image.new("RGBA", (100, 100), (25, 25, 25, 255))
-        bg.paste(tile, (0, 0), tile)
-        tiles.append(bg)
-    return tiles or [im.resize((100, 100), Image.Resampling.LANCZOS)]
-
-
-def make_cover(im):
-    im = trim(im)
-    im = im.resize((100, 100), Image.Resampling.LANCZOS)
-    bg = Image.new("RGBA", (100, 100), (25, 25, 25, 255))
-    bg.paste(im, (0, 0), im)
-    return bg
+    if bbox:
+        im = im.crop(bbox)
+    # redimensiona mantendo proporção
+    im.thumbnail((100, 100), Image.Resampling.LANCZOS)
+    # canvas transparente 100x100
+    canvas = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+    x = (100 - im.width) // 2
+    y = (100 - im.height) // 2
+    canvas.paste(im, (x, y), im)
+    return canvas
 
 
 def upload_emoji(im, set_name, owner_id, emoji="⭐"):
-    if im.size[0] < 10 or im.size[1] < 10:
-        im = im.resize((100, 100), Image.Resampling.LANCZOS)
+    im = make_emoji_image(im)
     buf = io.BytesIO()
     im.save(buf, format="PNG")
-    data_bytes = buf.getvalue()
-    if len(data_bytes) < 80:
-        raise RuntimeError("imagem gerada está vazia")
+    raw = buf.getvalue()
+    if len(raw) < 150:
+        raise RuntimeError(f"PNG muito pequeno ({len(raw)} bytes)")
     buf.seek(0)
-    files = {"png_sticker": ("e.png", buf, "image/png")}
+
+    files = {"png_sticker": ("emoji.png", buf, "image/png")}
     data = {
-        "user_id": owner_id,
+        "user_id": str(owner_id),
         "name": set_name,
         "title": "Era Logos",
         "sticker_type": "custom_emoji",
@@ -92,6 +69,7 @@ def upload_emoji(im, set_name, owner_id, emoji="⭐"):
         r = tg("createNewStickerSet", data=data, files=files)
     if not r.get("ok"):
         raise RuntimeError(r.get("description", "falha emoji"))
+
     info = tg("getStickerSet", json={"name": set_name})
     return info["result"]["stickers"][-1]["custom_emoji_id"]
 
@@ -100,32 +78,28 @@ def main():
     logo_url = PAYLOAD.get("logo_url")
     cover_url = PAYLOAD.get("cover_url")
     owner_id = PAYLOAD.get("owner_id")
-    sheet_id = PAYLOAD.get("sheet_id") or "x"
+    sheet_id = (PAYLOAD.get("sheet_id") or "x")[:10]
     callback = PAYLOAD.get("callback")
 
     if not owner_id:
         raise RuntimeError("owner_id ausente")
 
     bot_username = get_bot_username()
-    set_name = f"era_{sheet_id[:10]}_by_{bot_username}"
+    set_name = f"era_{sheet_id}_by_{bot_username}"
 
     result = {"logo_ids": [], "cover_id": None}
 
     if logo_url:
-        tiles = split_logo(download_image(logo_url))
-        for tile in tiles:
-            result["logo_ids"].append(upload_emoji(tile, set_name, owner_id))
+        im = download_image(logo_url)
+        result["logo_ids"].append(upload_emoji(im, set_name, owner_id))
 
     if cover_url:
-        cover = make_cover(download_image(cover_url))
-        result["cover_id"] = upload_emoji(cover, set_name, owner_id, "🖼")
+        im = download_image(cover_url)
+        result["cover_id"] = upload_emoji(im, set_name, owner_id, "🖼")
 
     if callback:
-        requests.post(
-            callback["url"],
-            json={"token": callback["token"], "result": result},
-            timeout=20,
-        )
+        requests.post(callback["url"], json={"token": callback["token"], "result": result}, timeout=20)
+
     print(json.dumps(result))
 
 
