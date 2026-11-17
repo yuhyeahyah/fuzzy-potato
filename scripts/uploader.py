@@ -2041,6 +2041,7 @@ def pack_jobs(jobs, dl: Path, tmp: Path, title: str, errors: list):
     return zpath, n_ok
 
 
+
 def main():
     mode = (PAYLOAD.get("mode") or "telegram").lower()
     host = (PAYLOAD.get("host") or "").lower() or None
@@ -2072,44 +2073,44 @@ def main():
         + (f" | envio={mode_desc}" if mode_desc else ""))
 
     # ---- 1) resolve: cada item vira um ou mais downloads ----
-jobs, pick_ex, pack_title = [], None, None
-force_global_zip = False  # caso especial do /docs
+    jobs, pick_ex, pack_title = [], None, None
+    force_global_zip = False  # caso especial do /docs
 
-for it in items:
-    if it.get("file_id"):
-        jobs.append({"kind": "tg", "file_id": it["file_id"], "name": it.get("name") or it.get("file_name")})
-        continue
-    url = (it.get("url") or "").strip()
-    if not url:
-        continue
-    ex = expand(url)
-    ents = ex["entries"]
-    sel = it.get("select")
-    if sel is not None:
-        wanted = {str(k) for k in sel}
-        ents = [e for e in ents if e["key"] in wanted]
-        if not ents:
-            raise RuntimeError("Nenhum dos arquivos escolhidos foi achado de novo no link")
-    elif opts.get("pick") and len(items) == 1 and len(ents) > 1:
-        pick_ex = ex
-    if len(ents) == 1:
-        say(f"🔍 Resolvido: {ex.get('note')}\n{ents[0]['name']}")
-    else:
-        say(f"🔍 {ex.get('title') or 'Link'}: {len(ents)} arquivo(s) ({ex.get('note')})")
-    if ex.get("warn"):
-        say(f"⚠️ {ex['warn']}")
-    jobs += [{"kind": "url", "entry": e} for e in ents]
-    custom_path = (it.get("path") or "").strip().strip("/")
-    if custom_path:
-        for j in jobs[-len(ents):]:
-            if j.get("kind") == "url":
-                j["entry"]["path"] = custom_path
-    if it.get("zip"):
-        force_global_zip = True
-        pack_title = pack_title or (ex.get("title") or "docs")
+    for it in items:
+        if it.get("file_id"):
+            jobs.append({"kind": "tg", "file_id": it["file_id"], "name": it.get("name") or it.get("file_name")})
+            continue
+        url = (it.get("url") or "").strip()
+        if not url:
+            continue
+        ex = expand(url)
+        ents = ex["entries"]
+        sel = it.get("select")
+        if sel is not None:
+            wanted = {str(k) for k in sel}
+            ents = [e for e in ents if e["key"] in wanted]
+            if not ents:
+                raise RuntimeError("Nenhum dos arquivos escolhidos foi achado de novo no link")
+        elif opts.get("pick") and len(items) == 1 and len(ents) > 1:
+            pick_ex = ex
+        if len(ents) == 1:
+            say(f"🔍 Resolvido: {ex.get('note')}\n{ents[0]['name']}")
+        else:
+            say(f"🔍 {ex.get('title') or 'Link'}: {len(ents)} arquivo(s) ({ex.get('note')})")
+        if ex.get("warn"):
+            say(f"⚠️ {ex['warn']}")
+        jobs += [{"kind": "url", "entry": e} for e in ents]
+        custom_path = (it.get("path") or "").strip().strip("/")
+        if custom_path:
+            for j in jobs[-len(ents):]:
+                if j.get("kind") == "url":
+                    j["entry"]["path"] = custom_path
+        if it.get("zip"):
+            force_global_zip = True
+            pack_title = pack_title or (ex.get("title") or "docs")
 
-if not jobs:
-    raise RuntimeError("Nada para baixar")
+    if not jobs:
+        raise RuntimeError("Nada para baixar")
 
     # ---- 2) vários arquivos e o usuário ainda não escolheu: o Worker mostra os botões ----
     if pick_ex is not None:
@@ -2134,80 +2135,78 @@ if not jobs:
         return
 
     # ---- 4) baixa e processa ----
-done, errors, results = 0, [], []
-with tempfile.TemporaryDirectory(prefix="uploader-") as td:
-    tmp = Path(td)
-    dl = tmp / "dl"
+    done, errors, results = 0, [], []
+    with tempfile.TemporaryDirectory(prefix="uploader-") as td:
+        tmp = Path(td)
+        dl = tmp / "dl"
 
-    if force_global_zip and mode in ("telegram", "upload"):
-        zpath, n_ok = pack_jobs(jobs, dl, tmp, pack_title or "docs", errors)
-        if n_ok:
-            try:
-                if mode == "telegram":
-                    deliver(zpath, f"📦 {zpath.name} ({n_ok} arquivo(s))", premium_client, volume_limit)
-                else:
-                    results.append(f"{zpath.name}: {do_upload(zpath, host)}")
-                done += 1
-            except Exception as e:
-                errors.append(f"{zpath.name}: {e}")
-    elif mode in ("telegram", "upload") and pack_title:
-        zpath, n_ok = pack_jobs(jobs, dl, tmp, pack_title, errors)
-        if n_ok:
-            try:
-                if mode == "telegram":
-                    deliver(zpath, f"📦 {zpath.name} ({n_ok} arquivo(s))", premium_client, volume_limit)
-                else:
-                    results.append(f"{zpath.name}: {do_upload(zpath, host)}")
-                done += 1
-            except Exception as e:
-                errors.append(f"{zpath.name}: {e}")
-    elif mode in ("telegram", "upload"):
-        total = len(jobs)
-        for n, job in enumerate(jobs, 1):
-            label = job_label(job)
-            path = None
-            try:
-                if total > 1:
-                    say(f"▶️ {n}/{total}: {label}")
-                path = fetch_job(job, dl)
-                if mode == "telegram":
-                    deliver(path, path.name, premium_client, volume_limit)
-                else:
-                    results.append(f"{path.name}: {do_upload(path, host, quiet=total > 1)}")
-                done += 1
-            except Exception as e:
-                print(f"erro em {label}: {e}", file=sys.stderr)
-                errors.append(f"{label}: {e}")
-            finally:
-                if path:
-                    path.unlink(missing_ok=True)
-    else:  # unzip / join
-        files = []
-        for n, job in enumerate(jobs, 1):
-            label = job_label(job)
-            try:
-                if len(jobs) > 1:
-                    say(f"⬇️ {n}/{len(jobs)}: {label}")
-                files.append(fetch_job(job, dl))
-            except Exception as e:
-                errors.append(f"{label}: {e}")
-        if files:
-            runner = run_unzip if mode == "unzip" else run_join
-            lines, errs = runner(files, dest, tmp, premium_client, volume_limit)
-            results += lines
-            errors += errs
-            done += len(lines)
+        if force_global_zip and mode in ("telegram", "upload"):
+            zpath, n_ok = pack_jobs(jobs, dl, tmp, pack_title or "docs", errors)
+            if n_ok:
+                try:
+                    if mode == "telegram":
+                        deliver(zpath, f"📦 {zpath.name} ({n_ok} arquivo(s))", premium_client, volume_limit)
+                    else:
+                        results.append(f"{zpath.name}: {do_upload(zpath, host)}")
+                    done += 1
+                except Exception as e:
+                    errors.append(f"{zpath.name}: {e}")
+        elif mode in ("telegram", "upload") and pack_title:
+            zpath, n_ok = pack_jobs(jobs, dl, tmp, pack_title, errors)
+            if n_ok:
+                try:
+                    if mode == "telegram":
+                        deliver(zpath, f"📦 {zpath.name} ({n_ok} arquivo(s))", premium_client, volume_limit)
+                    else:
+                        results.append(f"{zpath.name}: {do_upload(zpath, host)}")
+                    done += 1
+                except Exception as e:
+                    errors.append(f"{zpath.name}: {e}")
+        elif mode in ("telegram", "upload"):
+            total = len(jobs)
+            for n, job in enumerate(jobs, 1):
+                label = job_label(job)
+                path = None
+                try:
+                    if total > 1:
+                        say(f"▶️ {n}/{total}: {label}")
+                    path = fetch_job(job, dl)
+                    if mode == "telegram":
+                        deliver(path, path.name, premium_client, volume_limit)
+                    else:
+                        results.append(f"{path.name}: {do_upload(path, host, quiet=total > 1)}")
+                    done += 1
+                except Exception as e:
+                    print(f"erro em {label}: {e}", file=sys.stderr)
+                    errors.append(f"{label}: {e}")
+                finally:
+                    if path:
+                        path.unlink(missing_ok=True)
+        else:  # unzip / join
+            files = []
+            for n, job in enumerate(jobs, 1):
+                label = job_label(job)
+                try:
+                    if len(jobs) > 1:
+                        say(f"⬇️ {n}/{len(jobs)}: {label}")
+                    files.append(fetch_job(job, dl))
+                except Exception as e:
+                    errors.append(f"{label}: {e}")
+            if files:
+                runner = run_unzip if mode == "unzip" else run_join
+                lines, errs = runner(files, dest, tmp, premium_client, volume_limit)
+                results += lines
+                errors += errs
+                done += len(lines)
 
-    if results and (len(results) > 1 or mode in ("unzip", "join")):
-        say_long(["✅ Links:"] + results)
-    if errors:
-        say_long(["⚠️ Falhas:"] + errors)
-    if not done:
-        raise RuntimeError("nada foi enviado" + (f": {errors[0]}" if errors else ""))
-    say("✅ /uploader concluído." + (f" ({len(errors)} com erro)" if errors else ""))
-
-
-if __name__ == "__main__":
+        if results and (len(results) > 1 or mode in ("unzip", "join")):
+            say_long(["✅ Links:"] + results)
+        if errors:
+            say_long(["⚠️ Falhas:"] + errors)
+        if not done:
+            raise RuntimeError("nada foi enviado" + (f": {errors[0]}" if errors else ""))
+        say("✅ /uploader concluído." + (f" ({len(errors)} com erro)" if errors else ""))
+\n\nif __name__ == "__main__":
     try:
         main()
     except Exception as e:
