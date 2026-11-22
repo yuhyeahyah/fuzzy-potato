@@ -40,6 +40,12 @@ from onedrive_resolver import (
     download_public as onedrive_download,
 )
 
+from webhost_resolver import (
+    WebHostError, is_send_url, is_buzzheavier_url,
+    expand_public as webhost_expand, download_public as webhost_download,
+    fresh_url as webhost_fresh_url,
+)
+
 PAYLOAD = json.loads(os.environ["PAYLOAD"])
 ARGS = PAYLOAD  # aliases
 CHAT_ID = int(PAYLOAD["chat_id"])
@@ -410,12 +416,11 @@ def resolve(url: str) -> dict:
     if "exoshare.org" in host or "exoshare" in host:
         return {"url": url, "name": None, "note": "ExoShare (API pode precisar de share id)"}
 
-    # ---------- BuzzHeavier ----------
-    if "buzzheavier.com" in host or "bzzhr" in host:
-        m = re.search(r"/([A-Za-z0-9]+)/?$", parsed.path)
-        if m:
-            return {"url": f"https://buzzheavier.com/{m.group(1)}/download",
-                    "name": None, "note": "BuzzHeavier"}
+    # ---------- Send/adminForge / BuzzHeavier ----------
+    if is_send_url(url) or is_buzzheavier_url(url):
+        ex = webhost_expand(url)
+        e = ex["entries"][0]
+        return {"url": webhost_fresh_url(e), "name": None, "note": ex["note"]}
 
     # ---------- KrakenFiles ----------
     if "krakenfiles.com" in host:
@@ -1211,35 +1216,15 @@ def swisstransfer_expand(url: str) -> dict:
             "note": "SwissTransfer"}
 
 
-# ---------- BuzzHeavier (o botão faz hx-get /ID/download?t=...; a resposta traz HX-Redirect) ----------
+# ---------- BuzzHeavier: keep complete signed URLs; download in the browser ----------
 def buzzheavier_expand(url: str) -> dict:
-    m = re.search(r"buzzheavier\.com/([A-Za-z0-9]+)", url)
-    if not m:
-        raise RuntimeError("BuzzHeavier: não achei o ID no link")
-    fid = m.group(1)
-    page = f"https://buzzheavier.com/{fid}"
-    html = _get(page, timeout=30, headers={**BROWSER, "Referer": "https://buzzheavier.com/"}).text
-    n = re.search(r'<p class="file-name">(.*?)</p>', html, re.S) or re.search(r"<title>(.*?)</title>", html, re.S)
-    name = unescape(n.group(1)).strip() if n else None
-    sz = re.search(r'class="size">([\d.]+)\s*([KMGT]?B)<', html)
-    size = int(float(sz.group(1)) * 1024 ** "BKMGT".index(sz.group(2)[0])) if sz else 0
-    ents = _finalize([{"url": page + "/download", "presign": "buzzheavier", "bz": fid,
-                       "name": name or fid, "size": size}])
-    return {"title": name or "BuzzHeavier", "entries": ents, "warn": "", "note": "BuzzHeavier"}
+    result = webhost_expand(url)
+    result["entries"] = _finalize(result["entries"])
+    return result
 
 
 def buzzheavier_link(e: dict) -> str:
-    page = f"https://buzzheavier.com/{e['bz']}"
-    html = _get(page, timeout=30, headers={**BROWSER, "Referer": "https://buzzheavier.com/"}).text
-    t = re.search(r'hx-get="(/' + re.escape(e["bz"]) + r'/download\?t=[^"&]+)', html)
-    dl = "https://buzzheavier.com" + unescape(t.group(1)) if t else page + "/download"
-    h = dict(UA)
-    h.update({"HX-Request": "true", "HX-Current-URL": page, "Referer": page})
-    r = requests.get(dl, headers=h, timeout=30, allow_redirects=False)
-    loc = r.headers.get("hx-redirect") or r.headers.get("location")
-    if not loc:
-        raise RuntimeError(f"BuzzHeavier não devolveu o link (HTTP {r.status_code}; talvez Cloudflare)")
-    return requests.compat.urljoin(dl, loc)
+    return webhost_fresh_url(e)
 
 
 # ---------- transfer.it (MEGA; /t/ID; lista via API cs?x=ID) ----------
@@ -1552,8 +1537,8 @@ def entry_url(e: dict) -> str:
         return gdrive_resolve(e["gid"])[0]
     if e.get("presign") == "wetransfer":
         return wetransfer_link(e)
-    if e.get("presign") == "buzzheavier":
-        return buzzheavier_link(e)
+    if e.get("presign") in ("send", "buzzheavier"):
+        return webhost_fresh_url(e)
     if e.get("presign") == "follow":
         return _follow_link(e["url"], e.get("headers"))
     if e.get("presign"):
@@ -1566,6 +1551,11 @@ def expand(url: str) -> dict:
     # Terminal provider error: NEVER retry a OneDrive folder as a raw HTML file.
     if is_onedrive_url(url):
         return onedrive_expand(url)
+    # These provider failures are terminal: never fall back to raw HTML/ciphertext.
+    if is_send_url(url) or is_buzzheavier_url(url):
+        result = webhost_expand(url)
+        result["entries"] = _finalize(result["entries"])
+        return result
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -1591,8 +1581,6 @@ def expand(url: str) -> dict:
             return wetransfer_expand(url)
         if host.endswith("swisstransfer.com") and "/dl/" in parsed.path:
             return swisstransfer_expand(url)
-        if host.endswith("buzzheavier.com") and re.match(r"^/[A-Za-z0-9]+/?$", parsed.path):
-            return buzzheavier_expand(url)
         if host == "transfer.it" and parsed.path.startswith("/t/"):
             return transferit_expand(url)
         if host.endswith(("mega.nz", "mega.io", "mega.co.nz")):
@@ -1992,12 +1980,16 @@ def fetch_job(job, dl_dir: Path) -> Path:
         target = unique_path(dl_dir, hint or e.get("name") or "arquivo")
         say("\u2b07\ufe0f OneDrive: baixando o arquivo na mesma sessao do navegador.")
         return onedrive_download(e, target)
+    if e.get("presign") in ("send", "buzzheavier"):
+        label = "Send/adminForge" if e["presign"] == "send" else "BuzzHeavier"
+        say("\u2b07\ufe0f " + label + ": baixando pelo navegador, sem descartar a sessao ou a chave do link.")
+        return webhost_download(e, dl_dir)
     if e.get("presign") == "mega":
         return mega_download(e, dl_dir)
     if e.get("presign") == "gdrive":
         return download_to(entry_url(e), dl_dir, hint)
-    if e.get("presign") in ("follow", "buzzheavier"):
-        return download_to(entry_url(e), dl_dir, hint, e.get("headers") if e.get("presign") == "follow" else None)
+    if e.get("presign") == "follow":
+        return download_to(entry_url(e), dl_dir, hint, e.get("headers"))
     if e.get("presign"):
         return download_to(entry_url(e), dl_dir, hint)
     try:
