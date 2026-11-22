@@ -190,7 +190,8 @@ def validate_file(path: Path, name: str, exact_size: int | None = None) -> int:
 
 def log(provider: str, phase: str, event: str, **metrics) -> None:
     # Callers pass code-generated categories/numbers only, never page text/URLs.
-    print('[' + provider + ':v1] ' + json.dumps({
+    version = 2 if provider == 'buzzheavier' else 1
+    print('[' + provider + ':v' + str(version) + '] ' + json.dumps({
         'phase': phase, 'event': event, **metrics,
     }, ensure_ascii=True), flush=True)
 
@@ -201,6 +202,7 @@ class Limits:
     event_seconds: float = 90
     poll_ms: int = 250
     sw_seconds: float = 10
+    challenge_seconds: float = 20  # Passive observation only; no clicks/reloads.
 
 
 @contextmanager
@@ -242,7 +244,7 @@ def open_browser(downloads: Path):
             raise
         except Exception as exc:
             raise WebHostError('Hosts: falha no navegador (' + type(exc).__name__ + '). '
-                               'Veja [send:v1] ou [buzzheavier:v1] no log.') from None
+                               'Veja [send:v1] ou [buzzheavier:v2] no log.') from None
         finally:
             if context is not None:
                 context.close()
@@ -280,6 +282,14 @@ class Capture:
         self.document_status = None
         self.send_sw_ready = False
         self.uncontrolled_send_downloads = 0
+        self.main_page = None
+        self.cf_challenge_responses = 0
+        self.cf_active = set()
+        self.file_http = {}
+        self.challenge_waits = 0
+        self.challenge_wait_seconds = 0.0
+        self.buzz_error_state = {}
+        self.last_buzz_challenge = False
 
     def on_download(self, download):
         self.download_events += 1
@@ -314,8 +324,38 @@ class Capture:
                 self.sw_responses += 1
                 if self.spec.provider == 'send' and _trusted_download(response.url, self.spec):
                     self.send_sw_ready = True
-            if response.request.resource_type == 'document':
-                self.document_status = response.status
+            is_document = response.request.resource_type == 'document'
+            is_main = is_document
+            if is_document and self.main_page is not None:
+                try:
+                    is_main = response.frame == self.main_page.main_frame
+                except Exception:
+                    is_main = False
+            if self.spec.provider != 'buzzheavier' or is_main:
+                if is_document:
+                    self.document_status = response.status
+            if self.spec.provider == 'buzzheavier':
+                # Third-party scripts, ads and PAT checks must not determine
+                # whether this FILE was challenged. Never log URLs or headers.
+                kind = None
+                try:
+                    observed = parse_link(response.url)
+                    if observed.file_id == self.spec.file_id:
+                        kind = observed.kind
+                except WebHostError:
+                    pass
+                if kind and response.request.resource_type in ('document', 'fetch', 'xhr'):
+                    self.file_http[kind] = response.status
+                scope = 'document' if is_main else (kind if (
+                    kind in ('endpoint', 'cdn') and response.request.resource_type in ('fetch', 'xhr')
+                ) else None)
+                if scope:
+                    mitigated = str(response.headers.get('cf-mitigated', '')).lower() == 'challenge'
+                    if mitigated:
+                        self.cf_challenge_responses += 1
+                        self.cf_active.add(scope)
+                    else:
+                        self.cf_active.discard(scope)
             if self.spec.provider == 'send' and '/api/metadata/' in p.path:
                 self.metadata_status = response.status
             # Only a successful response for THIS file's /download may supply
@@ -331,6 +371,7 @@ class Capture:
             pass
 
     def attach(self, context, page):
+        self.main_page = page
         page.on('download', self.on_download)
         context.on('response', self.on_response)
         def failed(request):
@@ -342,13 +383,24 @@ class Capture:
         page.on('pageerror', js_error)
 
     def report(self, phase: str, event: str):
+        details = {}
+        if self.spec.provider == 'buzzheavier':
+            details = {
+                'cf_challenge_responses': self.cf_challenge_responses,
+                'cf_challenge_active': sorted(self.cf_active),
+                'file_http': dict(self.file_http),
+                'challenge_waits': self.challenge_waits,
+                'challenge_wait_seconds': round(self.challenge_wait_seconds, 1),
+                # Only fixed categories and booleans from our classifier.
+                'page_evidence': dict(self.buzz_error_state),
+            }
         log(self.spec.provider, phase, event, http=dict(self.http),
             network_failures=dict(self.failed_requests), download_events=self.download_events,
             retained_downloads=int(self.download is not None), rejected_downloads=self.rejected,
             service_worker_responses=self.sw_responses, js_errors=self.js_errors,
             metadata_status=self.metadata_status, document_status=self.document_status,
             service_worker_controlled=self.send_sw_ready,
-            uncontrolled_send_downloads=self.uncontrolled_send_downloads)
+            uncontrolled_send_downloads=self.uncontrolled_send_downloads, **details)
 
 
 # Uses the exact download controls in the HTML supplied by the user, not generic
@@ -385,6 +437,83 @@ ERROR_STATE_JS = r"""() => {
 }"""
 
 
+# Buzz-specific classifier. Keep Send's existing error detection unchanged.
+# No page title, body, filename, token or cookie is exported in diagnostics.
+BUZZ_ERROR_STATE_JS = r"""() => {
+  const visible = e => {
+    if (!e || !e.getClientRects().length) return false;
+    const c = getComputedStyle(e), r = e.getBoundingClientRect();
+    return c.visibility !== 'hidden' && c.display !== 'none' && r.width > 0 && r.height > 0;
+  };
+  const text = (document.body ? document.body.innerText : '').toLowerCase();
+  const title = document.title.toLowerCase().trim();
+  const fileUI = visible(document.querySelector('.file-name')) &&
+    [...document.querySelectorAll('a.download-btn')].some(visible);
+  // Anchor the title: a real file named "Just a moment.mp3" is not a challenge.
+  const titleKind = /^(just a moment|um momento|aguarde um momento)(?:\.{1,3}|!|\u2026)?$/.test(title)
+    ? 'loading' : /^(attention required|atencao necessaria|aten\u00e7\u00e3o necess\u00e1ria)(?:!)?(?:\s*\|\s*cloudflare)?$/.test(title)
+    ? 'attention' : 'other';
+  const mainChallenge = [...document.querySelectorAll('#challenge-running, #challenge-stage')].some(visible);
+  const turnstileVisible = [...document.querySelectorAll('.cf-turnstile')].some(visible);
+  const humanPrompt = /verify (?:that )?you are human(?:\s|!|\.(?:\s|$)|$)|verifique[^\n]{0,70}humano(?:\s|!|\.(?:\s|$)|$)/.test(text);
+  const loadingPrompt = /checking your browser|performing security verification/.test(text);
+  return {
+    challenge: mainChallenge || (turnstileVisible && (humanPrompt || loadingPrompt)) ||
+      (titleKind !== 'other' && !fileUI),
+    title_kind: titleKind, file_ui: fileUI, challenge_container: mainChallenge,
+    turnstile_visible: turnstileVisible, human_prompt: humanPrompt,
+    expired: /link has expired|link expirou|download link has expired|file has expired|arquivo expirou|arquivo foi removido/.test(text),
+    denied: /^(access denied|acesso negado|403 forbidden)(?:[!:.\s]|$)/.test(title)
+  };
+}"""
+
+
+def _buzz_error_state(page, cap: Capture) -> dict:
+    error = dict(_state(page, BUZZ_ERROR_STATE_JS))
+    if error:
+        cap.last_buzz_challenge = bool(error.get('challenge'))
+    else:
+        # An evaluation interrupted by navigation is not proof of clearance.
+        error['challenge'] = cap.last_buzz_challenge
+    cap.buzz_error_state = {
+        'title_kind': error.get('title_kind') if error.get('title_kind') in
+            ('loading', 'attention', 'other') else 'unavailable',
+        **{key: bool(error.get(key)) for key in
+           ('file_ui', 'challenge_container', 'turnstile_visible', 'human_prompt')},
+    }
+    error['challenge'] = bool(error.get('challenge') or cap.cf_active)
+    return error
+
+
+def _wait_buzz_interstitial(page, cap: Capture, limits: Limits) -> dict:
+    """Observe the same tab for a bounded interval; never solve/retry a challenge.
+
+    Merely seeing a loading title is not proof of an obligatory human CAPTCHA.
+    If access is not granted by the site, stop with measured evidence instead.
+    """
+    error = _buzz_error_state(page, cap)
+    if not error.get('challenge') or cap.download is not None:
+        return error
+    started = time.monotonic()
+    deadline = started + max(0.0, min(60.0, limits.challenge_seconds))
+    cap.challenge_waits += 1
+    cap.report('access', 'verification-observed')
+    while error.get('challenge') and cap.download is None and time.monotonic() < deadline:
+        remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+        page.wait_for_timeout(min(limits.poll_ms, remaining_ms))
+        error = _buzz_error_state(page, cap)
+    cap.challenge_wait_seconds += time.monotonic() - started
+    if cap.download is not None or not error.get('challenge'):
+        cap.report('access', 'verification-cleared')
+        return error
+    cap.report('access', 'verification-persisted')
+    evidence = 'cf-mitigated=challenge' if cap.cf_active else 'titulo/elementos da pagina'
+    raise WebHostError('BuzzHeavier: a tela de verificacao permaneceu durante a espera '
+                       '(' + evidence + '). O download nao foi liberado nesta sessao do runner. '
+                       'Isso nao confirma CAPTCHA manual nem bloqueio por IP. '
+                       'Veja [buzzheavier:v2]; nenhuma verificacao foi resolvida pelo bot.')
+
+
 def _state(page, script):
     try:
         return page.evaluate(script) or {}
@@ -392,8 +521,14 @@ def _state(page, script):
         return {}
 
 
-def _check_page_error(page, cap: Capture, *, signed_retry: bool = False) -> None:
-    error = _state(page, ERROR_STATE_JS)
+def _check_page_error(page, cap: Capture, *, signed_retry: bool = False,
+                      limits: Limits | None = None) -> None:
+    if cap.spec.provider == 'buzzheavier':
+        error = _wait_buzz_interstitial(page, cap, limits or Limits())
+        if cap.download is not None:
+            return
+    else:
+        error = _state(page, ERROR_STATE_JS)
     if error.get('challenge'):
         raise WebHostError(cap.spec.label + ': o site exige verificacao humana/Cloudflare no runner. '
                            'O bot nao resolve CAPTCHA nem contorna esse bloqueio.')
@@ -407,6 +542,8 @@ def _check_page_error(page, cap: Capture, *, signed_retry: bool = False) -> None
 
 def _navigate(page, cap: Capture, url: str, limits: Limits, *, referer: str | None = None):
     cap.document_status = None
+    if cap.spec.provider == 'buzzheavier':
+        cap.cf_active.clear()
     try:
         response = page.goto(url, wait_until='domcontentloaded', timeout=limits.page_seconds * 1000,
                              **({'referer': referer} if referer else {}))
@@ -422,7 +559,7 @@ def _navigate(page, cap: Capture, url: str, limits: Limits, *, referer: str | No
 def _wait_download(page, cap: Capture, limits: Limits, *, seconds: float | None = None):
     deadline = time.monotonic() + (limits.event_seconds if seconds is None else seconds)
     while cap.download is None and time.monotonic() < deadline:
-        _check_page_error(page, cap)
+        _check_page_error(page, cap, limits=limits)
         page.wait_for_timeout(limits.poll_ms)
     return cap.download
 
@@ -485,12 +622,17 @@ def _buzz_download(context, page, cap: Capture, limits: Limits):
         page.set_extra_http_headers({})
         if cap.download is not None:
             return cap.download
-        _check_page_error(page, cap, signed_retry=True)
+        _check_page_error(page, cap, signed_retry=True, limits=limits)
+        if cap.download is not None:
+            return cap.download
         if cap.hx_redirect:
             direct, cap.hx_redirect = cap.hx_redirect, None
             _navigate(page, cap, direct, limits, referer=spec.page)
             if cap.download is not None:
                 return cap.download
+        _check_page_error(page, cap, signed_retry=True, limits=limits)
+        if cap.download is not None:
+            return cap.download
         # Refresh the public share page ONCE after an expired/unusable signed
         # link. Do not fabricate /ID/download, t= or v= values.
         cap.report('signed-link', 'refresh-share-page')
@@ -501,7 +643,7 @@ def _buzz_download(context, page, cap: Capture, limits: Limits):
     button = None
     state = {}
     while time.monotonic() < deadline:
-        _check_page_error(page, cap)
+        _check_page_error(page, cap, limits=limits)
         state = _state(page, BUZZ_STATE_JS)
         for link in state.get('links', []):
             action = link.get('hx') or link.get('href')
@@ -514,11 +656,12 @@ def _buzz_download(context, page, cap: Capture, limits: Limits):
         if button is not None:
             break
         if cap.document_status in (401, 403, 404, 410):
+            cap.report('access', 'http-denied')
             raise WebHostError('BuzzHeavier: pagina recusada pelo site (HTTP ' + str(cap.document_status) + '). '
                                'O link foi preservado; o runner pode estar bloqueado ou o arquivo indisponivel.')
         page.wait_for_timeout(limits.poll_ms)
     if button is None:
-        raise WebHostError('BuzzHeavier: botao de download deste arquivo nao apareceu. Veja [buzzheavier:v1].')
+        raise WebHostError('BuzzHeavier: botao de download deste arquivo nao apareceu. Veja [buzzheavier:v2].')
     cap.expected_name = state.get('name') or ''
     cap.armed = True
     log('buzzheavier', 'page', 'ready', has_filename=bool(cap.expected_name))
@@ -530,7 +673,7 @@ def _buzz_download(context, page, cap: Capture, limits: Limits):
     got = _wait_download(page, cap, limits)
     if got is None:
         raise WebHostError('BuzzHeavier: clique realizado, mas nenhum download valido iniciou. '
-                           'O site pode exigir verificacao ou recusar o runner; veja [buzzheavier:v1].')
+                           'O site pode exigir verificacao ou recusar o runner; veja [buzzheavier:v2].')
     return got
 
 
