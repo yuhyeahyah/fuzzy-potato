@@ -524,7 +524,7 @@ def resolve(url: str) -> dict:
         if len(ex["entries"]) != 1:
             raise OneDriveError("OneDrive: pasta com varios arquivos; use expand() para abrir o seletor.")
         e = ex["entries"][0]
-        return {"url": e["url"], "name": e["name"], "note": ex["note"]}
+        return {"url": onedrive_fresh_url(e), "name": e["name"], "note": ex["note"]}
 
     # ---------- BerkasDrive ----------
     if "berkasdrive.com" in host:
