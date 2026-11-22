@@ -49,10 +49,11 @@ jobs:
               out.write("needed=" + str(bool(needed)).lower() + "\n")
           PYCODE
 
+      # Chromium completo: o resolvedor usa channel="chromium" (new headless).
       - name: Instalar Chromium para OneDrive
         if: steps.onedrive.outputs.needed == 'true'
         timeout-minutes: 6
-        run: python -m playwright install --with-deps --only-shell chromium
+        run: python -m playwright install --with-deps chromium
 
       # 7z só é preciso para .rar/.7z; ZIP e partes .zip.001 funcionam sem ele.
       # O apt do runner já travou em outros workflows, então não derruba o job se falhar.
@@ -69,6 +70,7 @@ jobs:
 
       - name: Executar uploader
         env:
+          PYTHONUNBUFFERED: "1"
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
