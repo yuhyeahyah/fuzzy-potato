@@ -34,6 +34,11 @@ from urllib.parse import quote, unquote, urlparse
 
 import requests
 
+from onedrive_resolver import (
+    OneDriveError, clean_url as onedrive_clean_url, expand_public as onedrive_public,
+    fresh_url as onedrive_fresh_url, is_onedrive_url, is_direct_url as onedrive_direct,
+)
+
 PAYLOAD = json.loads(os.environ["PAYLOAD"])
 ARGS = PAYLOAD  # aliases
 CHAT_ID = int(PAYLOAD["chat_id"])
@@ -512,8 +517,14 @@ def resolve(url: str) -> dict:
         return {"url": url, "name": None, "note": "Box (use o modo zip_download se possível)"}
 
     # ---------- OneDrive ----------
-    if "onedrive.live.com" in host or "1drv.ms" in host:
-        return {"url": url, "name": None, "note": "OneDrive (melhor via downloadUrl capturado)"}
+    if is_onedrive_url(url):
+        if onedrive_direct(url):
+            return {"url": url, "name": None, "server_name": True, "note": "OneDrive (link direto)"}
+        ex = onedrive_expand(url)
+        if len(ex["entries"]) != 1:
+            raise OneDriveError("OneDrive: pasta com varios arquivos; use expand() para abrir o seletor.")
+        e = ex["entries"][0]
+        return {"url": e["url"], "name": e["name"], "note": ex["note"]}
 
     # ---------- BerkasDrive ----------
     if "berkasdrive.com" in host:
@@ -758,47 +769,10 @@ def pixeldrain_list(url: str) -> dict:
 
 
 def onedrive_expand(url: str) -> dict:
-    """Link público do OneDrive pessoal (1drv.ms / onedrive.live.com) pela API de shares.
-    Lista os arquivos do primeiro nível; subpastas não são abertas."""
-    enc = "u!" + base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
-    base = f"https://api.onedrive.com/v1.0/shares/{enc}"
-    hdr = {**UA, "Accept": "application/json"}
-    j = _get(base + "/root?expand=children", headers=hdr).json()
-    entries, folders, nolink = [], 0, 0
-
-    def add(c):
-        nonlocal nolink
-        dl = c.get("@content.downloadUrl")
-        if not dl:
-            nolink += 1
-            return
-        entries.append({"url": dl, "name": c.get("name"), "size": c.get("size")})
-
-    if "folder" in j or "children" in j:
-        children = list(j.get("children") or [])
-        nxt = j.get("children@odata.nextLink")
-        for _ in range(20):
-            if not nxt:
-                break
-            page = _get(nxt, headers=hdr).json()
-            children += page.get("value") or []
-            nxt = page.get("@odata.nextLink")
-        for c in children:
-            if "folder" in c:
-                folders += 1
-            else:
-                add(c)
-    else:
-        add(j)
-    ents = _finalize(entries)
-    if not ents:
-        raise RuntimeError("OneDrive: nenhum arquivo com link direto (link privado/empresarial?)")
-    warn = []
-    if folders:
-        warn.append(f"{folders} subpasta(s) não foram abertas")
-    if nolink:
-        warn.append(f"{nolink} arquivo(s) sem link direto")
-    return {"title": j.get("name") or "", "entries": ents, "warn": "; ".join(warn), "note": "OneDrive"}
+    """Resolve the public page in Chromium, including the selected subfolder."""
+    result = onedrive_public(url)
+    result["entries"] = _finalize(result["entries"])
+    return result
 
 
 # ---------- Box (mesma leitura do box2gofile.py: Box.postStreamData da página) ----------
@@ -1570,6 +1544,8 @@ def gdrive_folder_expand(url: str) -> dict:
 
 def entry_url(e: dict) -> str:
     """Link final de uma entrada (alguns hosts só assinam o link na hora de baixar)."""
+    if e.get("presign") == "onedrive":
+        return onedrive_fresh_url(e)
     if e.get("presign") == "gdrive":
         return gdrive_resolve(e["gid"])[0]
     if e.get("presign") == "wetransfer":
@@ -1584,6 +1560,10 @@ def entry_url(e: dict) -> str:
 
 
 def expand(url: str) -> dict:
+    url = onedrive_clean_url(url)
+    # Terminal provider error: NEVER retry a OneDrive folder as a raw HTML file.
+    if is_onedrive_url(url):
+        return onedrive_expand(url)
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -1597,8 +1577,6 @@ def expand(url: str) -> dict:
             return pixeldrain_list(url)
         if host.endswith(("pixeldrain.com", "pixeldrain.net", "pixeldrain.dev", "pixeldra.in")) and re.search(r"/(?:u|api/file)/", parsed.path):
             return pixeldrain_file(url)
-        if host.endswith(("onedrive.live.com", "1drv.ms")):
-            return onedrive_expand(url)
         if host == "box.com" or host.endswith((".box.com", ".app.box.com")) or host == "app.box.com":
             return box_expand(url)
         if host.endswith("sendgb.com"):
@@ -1995,6 +1973,25 @@ def fetch_job(job, dl_dir: Path) -> Path:
             raise RuntimeError(f"{e.get('name')}: {size / 2**30:.1f} GiB não cabe no disco do runner "
                                f"({free / 2**30:.1f} GiB livres)")
     hint = None if e.get("server_name") else e.get("name")
+    if e.get("presign") == "onedrive":
+        for attempt in range(2):
+            try:
+                url = onedrive_fresh_url(e, force=bool(attempt))
+                return download_to(url, dl_dir, hint)
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else 0
+                if attempt == 0 and status in (401, 403, 410):
+                    continue
+                raise OneDriveError(f"OneDrive: download recusado (HTTP {status}); confira acesso ao arquivo.") from None
+            except OneDriveError:
+                raise
+            except RuntimeError as exc:
+                if attempt == 0 and "HTML" in str(exc):
+                    continue
+                raise OneDriveError("OneDrive: a resposta nao era um arquivo; o download pode ter sido bloqueado.") from None
+            except requests.RequestException:
+                raise OneDriveError("OneDrive: falha de rede durante o download; tente novamente.") from None
+        raise OneDriveError("OneDrive: nao foi possivel renovar o link de download.")
     if e.get("presign") == "mega":
         return mega_download(e, dl_dir)
     if e.get("presign") == "gdrive":
