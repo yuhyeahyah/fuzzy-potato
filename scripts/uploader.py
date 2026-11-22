@@ -669,7 +669,8 @@ def say_long(lines, limit=3800):
 # Expansão de links (um link pode virar vários arquivos: pastas)
 #   expand(url) -> {"title", "entries": [{key,name,size,path,url,headers}], "warn", "note"}
 # ---------------------------------------------------------------------------
-PICK_MAX = 40  # quantos itens vão para os botões (igual ao UP_MAX_BUTTONS do Worker)
+PICK_MAX_ITEMS = 5000  # protecao, nao tamanho de pagina; igual ao Worker
+PICK_MAX_BODY = 4_000_000  # bytes UTF-8; igual ao UP_MAX_BODY do Worker
 
 
 def _post(url, **kw):
@@ -1615,13 +1616,24 @@ def post_picker(cb, ex) -> bool:
     if not url or not token:
         return False
     ents = ex["entries"]
+    if len(ents) > PICK_MAX_ITEMS:
+        raise RuntimeError(
+            f"Seletor: {len(ents)} arquivos excedem o limite de {PICK_MAX_ITEMS}. "
+            "Abra uma subpasta menor. Nenhum arquivo foi baixado."
+        )
     body = {
         "token": token, "ok": True, "title": ex.get("title") or "", "total": len(ents),
         "warn": ex.get("warn") or "",
         "items": [{"key": e["key"], "name": e["name"], "size": e.get("size") or 0, "path": e.get("path") or ""}
-                  for e in ents[:PICK_MAX]],
+                  for e in ents],
     }
-    data = json.dumps(body, ensure_ascii=False).encode()
+    data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(data) > PICK_MAX_BODY:
+        raise RuntimeError(
+            "Seletor: os nomes e caminhos ultrapassam o limite de dados da listagem. "
+            "Abra uma subpasta menor. Nenhum arquivo foi baixado."
+        )
+    print(f"[uploader:picker] enviando {len(ents)} nomes ({len(data)} bytes); paginas no Worker")
     for wait in (0, 3, 8, 15, 30, 45):
         if wait:
             time.sleep(wait)
@@ -2102,7 +2114,10 @@ def main():
         if post_picker(cb, pick_ex):
             print("lista entregue ao Worker; aguardando a escolha")
             return
-        say("⚠️ Não consegui abrir o seletor de arquivos; vou usar todos os arquivos do link.")
+        raise RuntimeError(
+            "Não consegui abrir o seletor de arquivos. Nenhum arquivo foi baixado. "
+            "Confira se o Worker e scripts/uploader.py foram atualizados e envie o comando novamente."
+        )
 
     # ---- 3) só links ----
     if mode == "link":
