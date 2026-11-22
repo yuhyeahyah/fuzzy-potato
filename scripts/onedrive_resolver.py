@@ -9,14 +9,22 @@ HTTP statuses and error categories, never tokens, names, cookies or full URLs.
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from html import unescape
 import json
 import os
+from pathlib import Path
 import posixpath
 import re
 import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import unicodedata
+import zipfile
 import time
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlsplit, urlunsplit
@@ -164,7 +172,7 @@ class Capture:
         uid = _uid(url, item_id)
         old = self.files.get(uid, {})
         self.files[uid] = {
-            'url': url, 'name': name if isinstance(name, str) and name else old.get('name'),
+            **old, 'url': url, 'name': name if isinstance(name, str) and name else old.get('name'),
             'size': _size(size) or old.get('size', 0), 'od_uid': uid,
         }
 
@@ -407,6 +415,15 @@ def _page_state(page, cap: Capture) -> str:
     return 'no-listing'
 
 
+def _same_download_name(suggested: str, expected: str) -> bool:
+    # Names are identifiers, not filesystem paths. Reject rather than accept an
+    # unrelated attachment (e.g. an error.html or a folder-wide ZIP).
+    if not suggested or not expected:
+        return False
+    fold = lambda v: unicodedata.normalize('NFC', str(v)).casefold()
+    return fold(suggested) == fold(expected)
+
+
 def _match_file(entries: list[dict], entry: dict) -> dict | None:
     uid = entry.get('od_uid')
     if uid:
@@ -419,7 +436,11 @@ def _match_file(entries: list[dict], entry: dict) -> dict | None:
 
 
 class BrowserResolver:
-    def __init__(self, limits: Limits | None = None):
+    def __init__(self, limits: Limits | None = None, *, retain_download: bool = False):
+        # Discovery can cancel. Actual transfer MUST keep the original Download
+        # object and browser session, not replay download.url with a new GET.
+        self.retain_download = retain_download
+        self.download = None
         self.limits = limits or Limits()
         self.warnings: set[str] = set()
         self.deadline = 0.0
@@ -427,7 +448,7 @@ class BrowserResolver:
 
     def _report(self, phase: str, page, cap: Capture, stats: dict, started: float) -> dict:
         report = {
-            'version': 2, 'phase': phase,
+            'version': 3, 'phase': phase,
             'seconds': round(time.monotonic() - started, 1),
             'state': _page_state(page, cap),
             'files': len(cap.file_names), 'folders': len(cap.folders),
@@ -436,7 +457,7 @@ class BrowserResolver:
         }
         # Only predefined counters, status codes and error categories are emitted.
         self.diagnostics.append(report)
-        print('[onedrive:v2] ' + json.dumps(report, ensure_ascii=True), flush=True)
+        print('[onedrive:v3] ' + json.dumps(report, ensure_ascii=True), flush=True)
         return report
 
     @staticmethod
@@ -477,6 +498,18 @@ class BrowserResolver:
             except Exception:
                 pass
 
+    @staticmethod
+    def _start_captured_download(context, url: str) -> None:
+        if not _microsoft_url(url):
+            return
+        popup = context.new_page()
+        try:
+            popup.goto(url, wait_until='commit', timeout=15000)
+        except Exception:
+            # A navigation that becomes an attachment may throw ERR_ABORTED.
+            # Only the Download event can confirm a usable attachment.
+            pass
+
     def read_page(self, context, page, url: str, *, target: dict | None = None,
                   phase: str = 'list') -> tuple[str, str, Capture]:
         cap = Capture()
@@ -488,7 +521,8 @@ class BrowserResolver:
         stats = {'http': Counter(), 'network_failures': Counter(), 'json_objects': 0,
                  'js_errors': 0, 'body_read_errors': 0, 'navigation': 'ok',
                  'ui_download': 'not-needed', 'download_events': 0,
-                 'non_http_downloads': 0, 'scope_confirmed': False}
+                 'non_http_downloads': 0, 'scope_confirmed': False,
+                 'retained_downloads': 0, 'rejected_download_names': 0}
         active: dict = {}
         download_pages = []
 
@@ -553,21 +587,36 @@ class BrowserResolver:
 
         def on_download(download):
             stats['download_events'] += 1
+            keep = False
             try:
-                if active and _microsoft_url(download.url):
-                    suggested = download.suggested_filename or ''
-                    if not suggested or suggested.casefold() == active['name'].casefold():
+                suggested = download.suggested_filename or ''
+                same_name = bool(active) and _same_download_name(suggested, active['name'])
+                # Blob downloads are usable only while this browser is alive.
+                approved = _microsoft_url(download.url) or (
+                    download.url.startswith('blob:') and _microsoft_url(download.url[5:]))
+                if active and approved and same_name:
+                    if self.retain_download and self.download is None:
+                        self.download = download
+                        stats['retained_downloads'] += 1
+                        keep = True
+                    elif not self.retain_download and _microsoft_url(download.url):
                         cap.add(active['name'], download.url, 0, active.get('id'))
-                    else:
-                        self.warnings.add('Download com nome diferente do selecionado foi ignorado.')
+                        # This is an event URL, not a verified portable link.
+                        uid = _uid(download.url, active.get('id'))
+                        cap.files[uid]['od_transport'] = 'browser'
+                elif active and not same_name:
+                    stats['rejected_download_names'] += 1
+                    self.warnings.add('Download com nome diferente do selecionado foi ignorado.')
                 elif active:
                     stats['non_http_downloads'] += 1
             finally:
-                # Discovery must not download an entire multi-GB archive.
-                try:
-                    download.cancel()
-                except Exception:
-                    pass
+                if not keep:
+                    # Listing/discovery and unrelated downloads must not fetch
+                    # multi-GB files. The chosen transfer is never canceled here.
+                    try:
+                        download.cancel()
+                    except Exception:
+                        pass
 
         def attach_download(new_page):
             new_page.on('download', on_download)
@@ -595,7 +644,7 @@ class BrowserResolver:
         page.on('pageerror', on_page_error)
         attach_download(page)
         requested_path = _selected_path(url)
-        print('[onedrive:v2] ' + json.dumps({'phase': phase, 'event': 'start'}), flush=True)
+        print('[onedrive:v3] ' + json.dumps({'phase': phase, 'event': 'start'}), flush=True)
         try:
             try:
                 remaining = max(100, min(45000, int((deadline - time.monotonic()) * 1000)))
@@ -603,7 +652,7 @@ class BrowserResolver:
             except Exception as exc:
                 stats['navigation'] = _network_code(exc)
                 if page.url == 'about:blank':
-                    raise OneDriveError('OneDrive: navegacao falhou antes de abrir a pagina. Veja [onedrive:v2] no log.') from None
+                    raise OneDriveError('OneDrive: navegacao falhou antes de abrir a pagina. Veja [onedrive:v3] no log.') from None
             idle, pages = 0, 0
             previous = None
             ui_attempted = False
@@ -646,23 +695,36 @@ class BrowserResolver:
                         if resp is not None:
                             resp.dispose()
                 if target and stats['scope_confirmed']:
-                    if _match_file(cap.entries(), target):
+                    candidate = _match_file(cap.entries(), target)
+                    if self.download is not None or (candidate and not self.retain_download):
                         break
                     row = next((r for r in rows if not r.get('folder') and r.get('name') == target.get('name')), None)
+                    # Prefer the selected row even when JSON already has a URL:
+                    # the UI preserves POST bodies, one-time URLs and cookies.
                     if row and not ui_attempted:
                         ui_attempted = True
                         active.update(row)
                         stats['ui_download'] = self._click_download(page, row)
                         until = min(deadline, time.monotonic() + self.limits.download_seconds)
-                        while (stats['ui_download'] == 'clicked' and time.monotonic() < until
-                               and not _match_file(cap.entries(), target)):
+                        def ready():
+                            return self.download is not None if self.retain_download else bool(_match_file(cap.entries(), target))
+                        while stats['ui_download'] == 'clicked' and time.monotonic() < until and not ready():
                             page.wait_for_timeout(250)
                             drain()
+                        # A page can provide an actual downloadUrl without a
+                        # native download event. Open it in THIS browser session.
+                        candidate = _match_file(cap.entries(), target)
+                        if self.retain_download and not ready() and candidate:
+                            stats['ui_download'] = 'captured-url-in-browser'
+                            self._start_captured_download(context, candidate['url'])
+                            until = min(deadline, time.monotonic() + self.limits.download_seconds)
+                            while time.monotonic() < until and not ready():
+                                page.wait_for_timeout(250)
                         active.clear()
-                        if _match_file(cap.entries(), target):
+                        if ready():
                             break
                         if stats['ui_download'] == 'clicked':
-                            stats['ui_download'] = 'no-http-link'
+                            stats['ui_download'] = 'no-download-event' if self.retain_download else 'no-http-link'
                         break
                 if len(cap.file_names) >= self.limits.max_files or len(cap.files) >= self.limits.max_files:
                     self.warnings.add('Limite de arquivos atingido; listagem parcial.')
@@ -681,6 +743,16 @@ class BrowserResolver:
                     break
             else:
                 self.warnings.add('Limite de rolagem atingido; listagem parcial.')
+            if self.retain_download and target and self.download is None and not ui_attempted and stats['scope_confirmed']:
+                candidate = _match_file(cap.entries(), target)
+                if candidate:
+                    active.update({'name': target['name'], 'id': target.get('od_item_id')})
+                    stats['ui_download'] = 'captured-url-in-browser'
+                    self._start_captured_download(context, candidate['url'])
+                    until = min(self.deadline, time.monotonic() + self.limits.download_seconds)
+                    while self.download is None and time.monotonic() < until:
+                        page.wait_for_timeout(250)
+                    active.clear()
             if pending:
                 self.warnings.add('Limite de paginacao atingido; listagem parcial.')
             if not stats['scope_confirmed'] and (cap.file_names or cap.folders or cap.files):
@@ -745,7 +817,7 @@ class BrowserResolver:
                     ui = last.get('ui_download', 'not-attempted')
                     raise OneDriveError(
                         f'OneDrive: arquivo selecionado sem link de download. estado={state}; '
-                        f'arquivos={len(cap.file_names)}; acao={ui}. Veja [onedrive:v2] no log. '
+                        f'arquivos={len(cap.file_names)}; acao={ui}. Veja [onedrive:v3] no log. '
                         'Nenhuma pagina HTML foi enviada como arquivo.')
             now = time.time()
             for entry in cap.listing(final):
@@ -772,7 +844,7 @@ class BrowserResolver:
             raise OneDriveError(
                 f'OneDrive: nenhuma listagem de arquivos foi obtida. estado={state}; '
                 f'pastas={len(last_cap.folders)}; respostas_JSON={last.get("json_objects", 0)}; '
-                f'erros_JS={last.get("js_errors", 0)}. Veja [onedrive:v2] no log. '
+                f'erros_JS={last.get("js_errors", 0)}. Veja [onedrive:v3] no log. '
                 'Isso, sozinho, nao confirma pasta vazia ou privada.')
         dedup = {(e['path'], e['name']): e for e in entries}
         result = sorted(dedup.values(), key=lambda e: (e['path'].casefold(), e['name'].casefold()))
@@ -791,6 +863,12 @@ def expand_public(url: str, *, recursive: bool = True, limits: Limits | None = N
     if is_direct_url(url):
         return {'title': 'OneDrive', 'entries': [{'url': url, 'name': None, 'server_name': True}],
                 'warn': '', 'note': 'OneDrive (link direto)'}
+    with _open_browser() as (context, page):
+        return BrowserResolver(limits).collect(context, page, url, recursive, target=target)
+
+
+@contextmanager
+def _open_browser(downloads_path: Path | None = None):
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -799,6 +877,8 @@ def expand_public(url: str, *, recursive: bool = True, limits: Limits | None = N
         # Real Chromium in its new headless mode, not chromium-headless-shell.
         executable = os.getenv('ONEDRIVE_CHROMIUM_EXECUTABLE')
         launch = {'headless': True}
+        if downloads_path is not None:
+            launch['downloads_path'] = str(downloads_path)
         if executable:
             launch['executable_path'] = executable
         else:
@@ -810,7 +890,8 @@ def expand_public(url: str, *, recursive: bool = True, limits: Limits | None = N
             if not executable:
                 raise OneDriveError('OneDrive: instale o Chromium completo: python -m playwright install --with-deps chromium (sem --only-shell).') from None
             try:
-                browser = pw.chromium.launch(headless=True, executable_path=executable)
+                browser = pw.chromium.launch(headless=True, executable_path=executable,
+                    **({'downloads_path': str(downloads_path)} if downloads_path is not None else {}))
             except Exception:
                 raise OneDriveError('OneDrive: Chromium nao iniciou. Confira a instalacao no Actions.') from None
         context = None
@@ -818,11 +899,11 @@ def expand_public(url: str, *, recursive: bool = True, limits: Limits | None = N
             context = browser.new_context(locale='en-US', accept_downloads=True,
                 service_workers='allow', viewport={'width': 1440, 'height': 1000})
             page = context.new_page()
-            return BrowserResolver(limits).collect(context, page, url, recursive, target=target)
+            yield context, page
         except OneDriveError:
             raise
         except Exception as exc:
-            raise OneDriveError('OneDrive: falha no navegador (' + type(exc).__name__ + '). Veja [onedrive:v2] no log.') from None
+            raise OneDriveError('OneDrive: falha no navegador (' + type(exc).__name__ + '). Veja [onedrive:v3] no log.') from None
         finally:
             if context is not None:
                 context.close()
@@ -835,6 +916,8 @@ _REFRESH: dict[str, tuple[float, list[dict]]] = {}
 def fresh_url(entry: dict, *, force: bool = False) -> str:
     """A pending descriptor must NEVER return its HTML page to download_to()."""
     now = time.time()
+    if entry.get('od_transport') == 'browser':
+        raise OneDriveError('OneDrive: este arquivo exige download na sessao do navegador. Use /uploader sem o modo link.')
     if not entry.get('od_pending') and not force and now - float(entry.get('od_resolved_at') or 0) < 120:
         return entry['url']
     source = entry.get('od_page')
@@ -853,6 +936,228 @@ def fresh_url(entry: dict, *, force: bool = False) -> str:
         match = _match_file(files, entry)
     if not match or match.get('od_pending') or not _microsoft_url(match.get('url', '')):
         raise OneDriveError('OneDrive: o arquivo escolhido nao produziu um link de download HTTP autorizado.')
+    if match.get('od_transport') == 'browser':
+        raise OneDriveError('OneDrive: o evento de download nao fornece um link direto independente. Use /uploader sem o modo link.')
     entry.update({'url': match['url'], 'od_resolved_at': stamp, 'od_pending': False,
                   'od_uid': match.get('od_uid', entry.get('od_uid'))})
     return entry['url']
+
+
+def _transfer_log(event: str, **values) -> None:
+    """Only code-generated metrics/categories; never request/response contents."""
+    print('[onedrive:v3] ' + json.dumps({
+        'version': 3, 'phase': 'transfer', 'event': event, **values,
+    }, ensure_ascii=True), flush=True)
+
+
+def _validate_download(path: Path, expected_name: str, expected_size: int = 0) -> int:
+    """Validate without reading the whole archive into RAM or extracting it."""
+    size = path.stat().st_size
+    if expected_size and size != expected_size:
+        raise OneDriveError(
+            f'OneDrive: tamanho recebido diferente do listado ({size}/{expected_size} bytes). '
+            'O arquivo nao sera enviado.')
+    with path.open('rb') as stream:
+        prefix = stream.read(4096).lstrip(b'\xef\xbb\xbf\x00\t\r\n ').lower()
+    suffix = Path(expected_name).suffix.lower()
+    if suffix not in ('.html', '.htm') and prefix.startswith(
+            (b'<!doctype html', b'<html', b'<head', b'<body')):
+        raise OneDriveError('OneDrive: o navegador recebeu HTML em vez do arquivo escolhido. Nada foi enviado.')
+    # is_zipfile checks the ZIP end record without decompressing the contents.
+    # This is a structure check, not a full CRC/integrity scan of every entry.
+    if suffix == '.zip' and not zipfile.is_zipfile(path):
+        raise OneDriveError('OneDrive: o download nao e um ZIP completo reconhecivel. Nada foi enviado.')
+    return size
+
+
+def _source_for_transfer(entry: dict) -> str:
+    source = entry.get('od_page')
+    if not source and not is_direct_url(str(entry.get('url') or '')):
+        source = entry.get('url')
+    if not isinstance(source, str) or not _microsoft_url(source) or not is_onedrive_url(source):
+        raise OneDriveError('OneDrive: falta a pagina de origem do arquivo escolhido. Gere uma nova lista com /uploader.')
+    if not isinstance(entry.get('name'), str) or not entry['name']:
+        raise OneDriveError('OneDrive: descritor de arquivo sem nome. Gere uma nova lista com /uploader.')
+    return clean_url(source)
+
+
+def _download_in_browser(entry: dict, destination: Path, downloads_path: Path,
+                         *, limits: Limits | None = None) -> Path:
+    """Complete the original UI-initiated transfer before closing its context.
+
+    No requests.get(download.url), no exported cookies and no replayed POST.
+    The caller bounds this operation in a child process so timeout/cancellation
+    can close Chromium as well as Python. All large bytes stay on disk.
+    """
+    source = _source_for_transfer(entry)
+    limits = limits or Limits()
+    resolver = BrowserResolver(limits, retain_download=True)
+    resolver.deadline = time.monotonic() + limits.total_seconds
+    downloads_path.mkdir(parents=True, exist_ok=True)
+    with _open_browser(downloads_path) as (context, page):
+        context.add_init_script(script=CAPTURE_JS)
+        seed = sharing_url(source)
+        if seed != source:
+            resolver.read_page(context, page, seed, phase='bootstrap')
+        resolver.read_page(context, page, source, target={
+            'name': entry['name'], 'od_uid': entry.get('od_uid'),
+            'od_item_id': entry.get('od_item_id'),
+        }, phase='download-file')
+        download = resolver.download
+        if download is None:
+            diag = resolver.diagnostics[-1] if resolver.diagnostics else {}
+            raise OneDriveError(
+                'OneDrive: nenhum download do arquivo escolhido iniciou no navegador. '
+                f'estado={diag.get("state", "unknown")}; acao={diag.get("ui_download", "unknown")}. '
+                'Veja [onedrive:v3] no log.')
+        _transfer_log('started', transport='browser', original_download=True)
+        # path() waits for completion. Unlike a new HTTP GET it preserves the
+        # native request, cookies, POST body and redirects that produced it.
+        try:
+            completed = Path(download.path())
+        except Exception as exc:
+            _transfer_log('failed', reason='browser-download', error_type=type(exc).__name__)
+            raise OneDriveError('OneDrive: o download iniciado no navegador nao terminou. '
+                                'Veja [onedrive:v3]; nenhum arquivo parcial foi enviado.') from None
+        # Retain the selected name, not a path supplied by Content-Disposition.
+        size = _validate_download(completed, entry['name'], _size(entry.get('size')))
+        _transfer_log('validated', bytes=size, zip_structure=Path(entry['name']).suffix.lower() == '.zip')
+        # downloads_path is under destination.parent: hard-link + unlink avoids
+        # an extra multi-GB copy, does not overwrite a pre-existing destination,
+        # and publishes only the completed/validated file.
+        try:
+            os.link(completed, destination)
+        except FileExistsError:
+            raise OneDriveError('OneDrive: o destino local ja existe; nao foi sobrescrito.') from None
+        except OSError as exc:
+            _transfer_log('failed', reason='local-storage', errno=exc.errno)
+            raise OneDriveError('OneDrive: nao foi possivel preservar o arquivo no disco do runner.') from None
+        completed.unlink(missing_ok=True)
+        _transfer_log('saved', bytes=size)
+    return destination
+
+
+def _kill_transfer_process(proc) -> None:
+    # Playwright owns child Chromium processes. Kill the whole private process
+    # group on Linux (the Actions runner), not unrelated system browsers.
+    if os.name == 'posix':
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    elif proc.poll() is None:
+        proc.kill()
+    proc.wait()
+
+
+def download_public(entry: dict, destination: Path, *, timeout: float | None = None) -> Path:
+    """Download one selected item in a bounded browser process.
+
+    URLs go through stdin, not command-line arguments or diagnostic logs.
+    Only public sharing access already granted to the browser is used.
+    """
+    _source_for_transfer(entry)
+    destination = Path(destination).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        raise OneDriveError('OneDrive: o destino local ja existe; nao foi sobrescrito.')
+    if timeout is None:
+        try:
+            timeout = float(os.getenv('ONEDRIVE_DOWNLOAD_TIMEOUT', '3600'))
+        except ValueError:
+            raise OneDriveError('OneDrive: ONEDRIVE_DOWNLOAD_TIMEOUT deve ser um numero de segundos.') from None
+    if not 1 <= timeout <= 14400:
+        raise OneDriveError('OneDrive: timeout de download deve ficar entre 1 e 14400 segundos.')
+    reserve = 256 * 1024 * 1024
+    if _size(entry.get('size')) > shutil.disk_usage(destination.parent).free - reserve:
+        raise OneDriveError('OneDrive: nao ha espaco livre suficiente no disco do runner.')
+    # The parent owns cleanup, including partially downloaded files if the child
+    # is killed. Chromium's profile cleanup on normal exit is handled by PW.
+    with tempfile.TemporaryDirectory(prefix='.onedrive-', dir=destination.parent) as work:
+        workdir = Path(work)
+        downloads = workdir / 'downloads'
+        downloads.mkdir()
+        result_file = workdir / 'result.json'
+        # Never pass the Telegram/GitHub credentials to the download child.
+        env = dict(os.environ)
+        for key in ('BOT_TOKEN', 'TG_API_ID', 'TG_API_HASH', 'TG_PREMIUM_SESSION', 'PAYLOAD', 'GITHUB_TOKEN'):
+            env.pop(key, None)
+        env['PYTHONUNBUFFERED'] = '1'
+        env['TMPDIR'] = str(workdir)
+        spec = {'entry': {k: entry[k] for k in ('url', 'od_page', 'name', 'size', 'od_uid', 'od_item_id') if k in entry},
+                'destination': str(destination), 'downloads_path': str(downloads), 'result_file': str(result_file)}
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--download-entry'],
+                                stdin=subprocess.PIPE, text=True, env=env,
+                                start_new_session=(os.name == 'posix'))
+        data = json.dumps(spec)
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _kill_transfer_process(proc)
+                    _transfer_log('failed', reason='timeout')
+                    raise OneDriveError(f'OneDrive: download excedeu o limite de {timeout:g} segundos; transferencia cancelada.')
+                try:
+                    proc.communicate(input=data, timeout=min(15, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    data = None  # communicate() resumes writing/reading its original input.
+                    received = 0
+                    for file in downloads.iterdir():
+                        try:
+                            if file.is_file():
+                                received += file.stat().st_size
+                        except FileNotFoundError:
+                            pass
+                    _transfer_log('waiting', bytes_on_disk=received)
+                    if shutil.disk_usage(destination.parent).free < reserve:
+                        _kill_transfer_process(proc)
+                        _transfer_log('failed', reason='disk-space')
+                        raise OneDriveError('OneDrive: disco do runner ficou sem espaco; transferencia cancelada.')
+            try:
+                result = json.loads(result_file.read_text())
+            except (OSError, ValueError):
+                raise OneDriveError('OneDrive: processo de download encerrou sem resultado valido.') from None
+            if proc.returncode != 0 or not result.get('ok'):
+                # The result file is local and written only by the child below.
+                raise OneDriveError(result.get('error') or 'OneDrive: download no navegador falhou.')
+            if not destination.is_file():
+                raise OneDriveError('OneDrive: navegador terminou mas o arquivo local nao foi preservado.')
+            return destination
+        except BaseException:
+            if proc.poll() is None:
+                _kill_transfer_process(proc)
+            # TemporaryDirectory removes browser partials. A published file,
+            # if any, is already complete; do not unlink a possibly concurrent
+            # destination that we do not own (no-clobber semantics).
+            raise
+
+
+def _download_worker() -> int:
+    """Private subprocess entry point. No raw browser exceptions in logs."""
+    result_file = None
+    try:
+        spec = json.load(sys.stdin)
+        result_file = Path(spec['result_file'])
+        destination = Path(spec['destination'])
+        _download_in_browser(spec['entry'], destination, Path(spec['downloads_path']))
+        result = {'ok': True}
+        code = 0
+    except OneDriveError as exc:
+        result = {'ok': False, 'error': str(exc)}
+        code = 1
+    except Exception as exc:
+        _transfer_log('failed', reason='worker', error_type=type(exc).__name__)
+        result = {'ok': False, 'error': 'OneDrive: falha no processo de download (' + type(exc).__name__ + ').'}
+        code = 1
+    if result_file is not None:
+        result_file.write_text(json.dumps(result), encoding='utf-8')
+    return code
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] == ['--download-entry']:
+        raise SystemExit(_download_worker())
+    print('This module is called by scripts/uploader.py.', file=sys.stderr)
+    raise SystemExit(2)
