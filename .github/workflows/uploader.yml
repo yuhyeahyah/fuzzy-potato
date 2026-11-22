@@ -21,37 +21,61 @@ jobs:
         with:
           python-version: "3.12"
 
-      # o token de retorno (seletor de arquivos) vai no payload: some dos logs
-      - name: Mascara o token de retorno
-        if: github.event.client_payload.cb.token != ''
+      # Mask capabilities before any step displays PAYLOAD in its environment.
+      - name: Mascarar tokens e links privados nos logs
         run: |
-          T=$(jq -r '.client_payload.cb.token // empty' "$GITHUB_EVENT_PATH")
-          if [ -n "$T" ]; then echo "::add-mask::$T"; fi
+          python - <<'PYMASK'
+          import json, os
+          from urllib.parse import urlsplit, parse_qsl
+          p = json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8")).get("client_payload", {})
+          secrets = []
+          token = (p.get("cb") or {}).get("token")
+          if token:
+              secrets.append(str(token))
+          items = p.get("items") or [{"url": p.get("url", "")}]
+          for item in items:
+              if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+                  continue
+              u = item["url"]
+              secrets.append(u)
+              try:
+                  parts = urlsplit(u)
+                  if parts.fragment:
+                      secrets.append(parts.fragment)
+                  secrets.extend(value for key, value in parse_qsl(parts.query) if key in ("t", "v", "authkey", "redeem") and value)
+              except ValueError:
+                  pass
+          for value in dict.fromkeys(secrets):
+              escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print("::add-mask::" + escaped)
+          PYMASK
 
       - name: Instalar dependências
         run: |
           python -m pip install --disable-pip-version-check requests kurigram tgcrypto pycryptodome "playwright>=1.50,<2"
 
-      - name: Detectar compartilhamentos OneDrive
-        id: onedrive
+      - name: Detectar hosts que usam navegador
+        id: browser
         env:
           PAYLOAD: ${{ toJSON(github.event.client_payload) }}
         run: |
           python - <<'PYCODE'
           import json, os
           from scripts.onedrive_resolver import clean_url, is_onedrive_url, is_direct_url
+          from scripts.webhost_resolver import needs_browser
           p = json.loads(os.environ["PAYLOAD"])
           items = p.get("items") or [{"url": p.get("url", "")}]
           needed = any(isinstance(i, dict) and i.get("url") and
-                       is_onedrive_url(clean_url(i["url"])) and not is_direct_url(clean_url(i["url"]))
+                       ((is_onedrive_url(clean_url(i["url"])) and not is_direct_url(clean_url(i["url"])))
+                        or needs_browser(i["url"]))
                        for i in items)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
               out.write("needed=" + str(bool(needed)).lower() + "\n")
           PYCODE
 
       # Chromium completo: o resolvedor usa channel="chromium" (new headless).
-      - name: Instalar Chromium para OneDrive
-        if: steps.onedrive.outputs.needed == 'true'
+      - name: Instalar Chromium para OneDrive, Send e BuzzHeavier
+        if: steps.browser.outputs.needed == 'true'
         timeout-minutes: 6
         run: python -m playwright install --with-deps chromium
 
