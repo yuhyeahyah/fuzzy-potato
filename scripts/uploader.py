@@ -37,6 +37,7 @@ import requests
 from onedrive_resolver import (
     OneDriveError, clean_url as onedrive_clean_url, expand_public as onedrive_public,
     fresh_url as onedrive_fresh_url, is_onedrive_url, is_direct_url as onedrive_direct,
+    download_public as onedrive_download,
 )
 
 PAYLOAD = json.loads(os.environ["PAYLOAD"])
@@ -1974,24 +1975,11 @@ def fetch_job(job, dl_dir: Path) -> Path:
                                f"({free / 2**30:.1f} GiB livres)")
     hint = None if e.get("server_name") else e.get("name")
     if e.get("presign") == "onedrive":
-        for attempt in range(2):
-            try:
-                url = onedrive_fresh_url(e, force=bool(attempt))
-                return download_to(url, dl_dir, hint)
-            except requests.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else 0
-                if attempt == 0 and status in (401, 403, 410):
-                    continue
-                raise OneDriveError(f"OneDrive: download recusado (HTTP {status}); confira acesso ao arquivo.") from None
-            except OneDriveError:
-                raise
-            except RuntimeError as exc:
-                if attempt == 0 and "HTML" in str(exc):
-                    continue
-                raise OneDriveError("OneDrive: a resposta nao era um arquivo; o download pode ter sido bloqueado.") from None
-            except requests.RequestException:
-                raise OneDriveError("OneDrive: falha de rede durante o download; tente novamente.") from None
-        raise OneDriveError("OneDrive: nao foi possivel renovar o link de download.")
+        # The chosen UI download must finish in the original browser session.
+        # Repeating its URL with requests.get() loses cookies/POST/one-time state.
+        target = unique_path(dl_dir, hint or e.get("name") or "arquivo")
+        say("\u2b07\ufe0f OneDrive: baixando o arquivo na mesma sessao do navegador.")
+        return onedrive_download(e, target)
     if e.get("presign") == "mega":
         return mega_download(e, dl_dir)
     if e.get("presign") == "gdrive":
