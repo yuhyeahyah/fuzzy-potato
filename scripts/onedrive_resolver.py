@@ -2,12 +2,14 @@
 
 Reads the JSON responses that the page itself receives, like the supplied
 userscript. Does not turn an HTML sharing page into a pretend download URL.
-No cookies, authorization headers, or signed links are written to logs/disk.
+Lists visible files even before a downloadUrl exists. Resolves a selected file
+through its own Download menu when necessary. Diagnostics contain only counts,
+HTTP statuses and error categories, never tokens, names, cookies or full URLs.
 """
 from __future__ import annotations
 
 import base64
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from html import unescape
 import json
@@ -48,9 +50,13 @@ def is_onedrive_url(url: str) -> bool:
 
 
 def _microsoft_url(url: str) -> bool:
-    p = urlsplit(url)
-    h = (p.hostname or '').lower()
-    return p.scheme == 'https' and not p.username and not p.password and p.port in (None, 443) and (
+    try:
+        p = urlsplit(url)
+        port = p.port
+        h = (p.hostname or '').lower()
+    except ValueError:
+        return False
+    return p.scheme == 'https' and not p.username and not p.password and port in (None, 443) and (
         h == 'graph.microsoft.com' or any(_under(h, d) for d in (
             '1drv.ms', '1drv.com', 'live.com', 'onedrive.com',
             'sharepoint.com', 'sharepointonline.com', 'microsoftpersonalcontent.com',
@@ -111,6 +117,30 @@ def _size(value: Any) -> int:
         return 0
 
 
+MAX_CAPTURE_BYTES = 16 * 1024 * 1024
+
+
+def json_values(text: str):
+    """Decode bounded data; never evaluate scripts or arbitrary JavaScript."""
+    if not isinstance(text, str) or len(text) > MAX_CAPTURE_BYTES:
+        return
+    decoder = json.JSONDecoder()
+    value = text.lstrip('\ufeff \r\n\t')
+    # Standard JSON first; multipart bodies begin after a blank line.
+    candidates = [0] + [m.start(1) for m in re.finditer(r'(?m)^[ \t]*([\[{])', value)]
+    end = -1
+    for start in sorted(set(candidates))[:256]:
+        if start < end:
+            continue
+        try:
+            obj, used = decoder.raw_decode(value[start:])
+        except ValueError:
+            continue
+        if isinstance(obj, (dict, list)):
+            end = start + used
+            yield obj
+
+
 @dataclass
 class Capture:
     """Collects only downloadUrl fields, never arbitrary URLs from a page."""
@@ -119,6 +149,7 @@ class Capture:
     folders: dict[str, dict] = field(default_factory=dict)
     file_names: set[str] = field(default_factory=set)
     next_links: set[str] = field(default_factory=set)
+    metadata: dict[str, dict] = field(default_factory=dict)
 
     def name(self, item_id: Any, name: Any) -> None:
         if not isinstance(name, str) or not name.strip():
@@ -160,6 +191,8 @@ class Capture:
                 self.add(name, dl, obj.get('size', obj.get('Size', obj.get('File_x0020_Size'))), iid)
             if isinstance(name, str) and ('file' in obj or dl or str(obj.get('FSObjType', '')) == '0'):
                 self.file_names.add(name)
+                self.metadata[name] = {'name': name, 'id': str(iid or ''),
+                    'size': _size(obj.get('size', obj.get('Size', obj.get('File_x0020_Size'))))}
         for k, v in obj.items():
             if k.lower().endswith('odata.nextlink') and isinstance(v, str):
                 self.next_links.add(v)
@@ -178,6 +211,31 @@ class Capture:
                 self.folders.setdefault(r['name'], {'name': r['name']})
             elif r.get('name'):
                 self.file_names.add(r['name'])
+                old = self.metadata.get(r['name'], {})
+                self.metadata[r['name']] = {**old, 'name': r['name'],
+                    'id': str(r.get('id') or old.get('id') or ''),
+                    'size': old.get('size', 0)}
+
+    def text(self, text: str) -> bool:
+        """JSON, anti-XSSI JSON and JSON bodies in multipart/$batch responses."""
+        parsed = False
+        for value in json_values(text):
+            self.scan(value)
+            parsed = True
+        return parsed
+
+    def listing(self, source: str) -> list[dict]:
+        """Unresolved entries are explicit descriptors, NEVER direct downloads."""
+        result = self.entries()
+        resolved = {e['name'] for e in result}
+        for name in sorted(self.file_names - resolved):
+            meta = self.metadata.get(name, {})
+            iid = str(meta.get('id') or '')
+            result.append({'url': source, 'name': name, 'size': meta.get('size', 0),
+                'od_uid': 'pending:' + (iid or name), 'od_item_id': iid,
+                'od_pending': True, 'od_page': source, 'od_resolved_at': 0,
+                'presign': 'onedrive'})
+        return result
 
     def entries(self) -> list[dict]:
         out = []
@@ -217,53 +275,51 @@ def folder_url(current: str, folder: dict) -> str | None:
 
 
 CAPTURE_JS = r'''(() => {
-  if (window.__uploaderODCaptureV1) return;
-  const state = window.__uploaderODCaptureV1 = {items: [], bytes: 0, dropped: 0};
-  const LIMIT = 16 * 1024 * 1024;
-  function save(url, data, bytes) {
-    if (!data || typeof data !== 'object') return;
-    if (bytes > LIMIT) { state.dropped++; return; }
-    state.items.push({url, data, bytes}); state.bytes += bytes;
-    while (state.items.length > 32 || state.bytes > LIMIT) {
-      state.bytes -= state.items.shift().bytes; state.dropped++;
-    }
+  if (window.__uploaderODCaptureV2) return;
+  const s=window.__uploaderODCaptureV2={items:[],bytes:0,dropped:0};
+  const LIMIT=16*1024*1024;
+  function save(url,text) {
+    if (typeof text!=='string' || !/[\[{]/.test(text.slice(0,8192))) return;
+    if(text.length>LIMIT) {s.dropped++;return;}
+    s.items.push({url,text,bytes:text.length});s.bytes+=text.length;
+    while(s.items.length>64 || s.bytes>LIMIT) {s.bytes-=s.items.shift().bytes;s.dropped++;}
   }
-  function text(url, value) {
-    if (typeof value !== 'string' || value.length > LIMIT) return;
-    if (!/^[\s]*[\[{]/.test(value)) return;
-    try { save(url, JSON.parse(value), value.length); } catch (_) {}
+  async function bounded(response) {
+    const ct=(response.headers.get('content-type')||'').toLowerCase();
+    if (/^(audio|video|image|font)\//.test(ct) || /zip|octet-stream|pdf/.test(ct)) return;
+    if(Number(response.headers.get('content-length')||0)>LIMIT) return;
+    const r=response.clone();
+    if(!r.body) return;
+    const reader=r.body.getReader();const decoder=new TextDecoder();let chunks=[],size=0;
+    try {
+      while(true) {
+        const v=await reader.read();if(v.done) break;
+        size+=v.value.byteLength;
+        if(size>LIMIT) {s.dropped++;await reader.cancel();return;}
+        chunks.push(decoder.decode(v.value,{stream:true}));
+      }
+      chunks.push(decoder.decode());save(response.url,chunks.join(''));
+    } catch(_) {} finally {try{reader.releaseLock();}catch(_){}}
   }
-  const originalFetch = window.fetch;
-  if (originalFetch) window.fetch = function(...args) {
-    const promise = originalFetch.apply(this, args);
-    promise.then(r => {
-      const ct = (r.headers.get('content-type') || '').toLowerCase();
-      if (!ct.includes('json') && !ct.includes('text/plain')) return;
-      if (Number(r.headers.get('content-length') || 0) > LIMIT) { state.dropped++; return; }
-      try { r.clone().text().then(t => text(r.url, t)).catch(() => {}); } catch (_) {}
-    }).catch(() => {});
-    return promise;
+  const fetch0=window.fetch;
+  if(fetch0) window.fetch=function(...args) {
+    const p=fetch0.apply(this,args);
+    p.then(r=>{bounded(r).catch(()=>{});}).catch(()=>{});return p;
   };
-  const originalSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.send = function(...args) {
-    this.addEventListener('load', function() {
+  const send0=XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send=function(...args) {
+    this.addEventListener('load',function() {
       try {
-        if (this.responseType === 'json') {
-          const data = this.response;
-          save(this.responseURL, data, JSON.stringify(data).length);
-        } else if (this.responseType === '' || this.responseType === 'text') {
-          const ct = (this.getResponseHeader('content-type') || '').toLowerCase();
-          if (ct.includes('json') || ct.includes('text/plain')) text(this.responseURL, this.responseText);
-        }
-      } catch (_) {}
-    }, {once: true});
-    return originalSend.apply(this, args);
+        if(this.responseType==='json') save(this.responseURL,JSON.stringify(this.response));
+        else if(this.responseType==='' || this.responseType==='text') save(this.responseURL,this.responseText);
+      }catch(_){}
+    },{once:true});return send0.apply(this,args);
   };
 })()'''
 
 DRAIN_JS = r'''() => {
-  const s=window.__uploaderODCaptureV1;
-  if (!s) return {items:[], dropped:0};
+  const s=window.__uploaderODCaptureV2;
+  if(!s) return {items:[],dropped:0};
   const result={items:s.items.splice(0),dropped:s.dropped};s.bytes=0;s.dropped=0;return result;
 }'''
 
@@ -271,7 +327,7 @@ DRAIN_JS = r'''() => {
 DOM_ROWS_JS = r'''() => Array.from(document.querySelectorAll('[role="row"][data-selection-index]'))
   .filter(r => r.getAttribute('data-selection-index') !== '-1').map(r => {
     const f = r.querySelector('[data-automationid="field-LinkFilename"]');
-    const titled = f && f.querySelector('[title]');
+    const titled = f && (f.querySelector('[data-id="heroField"][title]') || f.querySelector('[title]'));
     const cb = r.querySelector('[data-automationid="selection-checkbox"]');
     const name = (titled && titled.getAttribute('title')) || (cb && cb.getAttribute('aria-label')) || (f && f.textContent.trim());
     const icons = Array.from(r.querySelectorAll('[data-automationid="field-DocIcon"] [aria-label]')).map(x => x.getAttribute('aria-label')).join(' ');
@@ -302,7 +358,64 @@ class Limits:
     max_scrolls: int = 150
     total_seconds: float = 600
     page_seconds: float = 90
-    settle_ms: int = 1200
+    settle_ms: int = 1000
+    download_seconds: float = 12
+
+
+def _selected_path(url: str) -> str:
+    query = dict(parse_qsl(urlsplit(url).query))
+    value = query.get('id') or query.get('RootFolder') or ''
+    return value.rstrip('/') if value.startswith('/') else ''
+
+
+BREADCRUMB_PATH_JS = r'''() => {
+  const crumbs=[...document.querySelectorAll('[data-automationid="breadcrumb-listitem"][data-item-key]')];
+  for(const el of crumbs.reverse()) {
+    try {const a=JSON.parse(el.getAttribute('data-item-key'));
+      const p=Array.isArray(a) && a.filter(v=>typeof v==='string' && v.startsWith('/')).pop();
+      if(p) return p;
+    }catch(_){}
+  }
+  return '';
+}'''
+
+
+def _network_code(error: Any) -> str:
+    """No arbitrary exception message reaches diagnostics."""
+    match = re.search(r'net::[A-Z0-9_]+', str(error or ''))
+    return match.group(0) if match else type(error).__name__
+
+
+def _page_state(page, cap: Capture) -> str:
+    if cap.file_names or cap.folders or cap.files:
+        return 'listing'
+    host = _host(page.url)
+    if host in ('login.live.com', 'login.microsoftonline.com'):
+        return 'login'
+    try:
+        # Text is classified in memory; it is never printed or saved.
+        text = page.locator('body').inner_text(timeout=1000).lower()[:12000]
+    except Exception:
+        return 'unavailable'
+    for key, patterns in (
+        ('access-denied', ('access denied', 'you need permission', 'request access', 'acesso negado', 'solicitar acesso')),
+        ('not-found', ("this item might not exist", 'this link has expired', 'este link expirou', 'item nao existe')),
+        ('empty', ('this folder is empty', 'esta pasta est\u00e1 vazia', 'this folder has no files')),
+    ):
+        if any(p in text for p in patterns):
+            return key
+    return 'no-listing'
+
+
+def _match_file(entries: list[dict], entry: dict) -> dict | None:
+    uid = entry.get('od_uid')
+    if uid:
+        hit = next((e for e in entries if e.get('od_uid') == uid), None)
+        if hit and not hit.get('od_pending'):
+            return hit
+    name = entry.get('name')
+    matches = [e for e in entries if e.get('name') == name and not e.get('od_pending')]
+    return matches[0] if len(matches) == 1 else None
 
 
 class BrowserResolver:
@@ -310,86 +423,208 @@ class BrowserResolver:
         self.limits = limits or Limits()
         self.warnings: set[str] = set()
         self.deadline = 0.0
+        self.diagnostics: list[dict] = []
 
-    def read_page(self, context, page, url: str) -> tuple[str, str, Capture]:
+    def _report(self, phase: str, page, cap: Capture, stats: dict, started: float) -> dict:
+        report = {
+            'version': 2, 'phase': phase,
+            'seconds': round(time.monotonic() - started, 1),
+            'state': _page_state(page, cap),
+            'files': len(cap.file_names), 'folders': len(cap.folders),
+            'download_urls': len(cap.files),
+            **stats,
+        }
+        # Only predefined counters, status codes and error categories are emitted.
+        self.diagnostics.append(report)
+        print('[onedrive:v2] ' + json.dumps(report, ensure_ascii=True), flush=True)
+        return report
+
+    @staticmethod
+    def _target_row(page, row: dict):
+        iid = str(row.get('id') or '')
+        if re.fullmatch(r'[A-Za-z0-9_-]{1,128}', iid):
+            return page.locator(f'[role="row"][data-selection-index="{iid}"]').first
+        field = page.locator('[data-automationid="field-LinkFilename"]').filter(
+            has_text=re.compile('^' + re.escape(str(row['name'])) + '$'))
+        return page.locator('[role="row"][data-selection-index]').filter(has=field).first
+
+    def _click_download(self, page, row: dict) -> str:
+        """Use ONLY the selected row's context menu, never folder-wide Download."""
+        try:
+            page.keyboard.press('Escape')
+            node = self._target_row(page, row)
+            node.scroll_into_view_if_needed(timeout=3000)
+            node.hover(timeout=3000)
+            more = node.locator('[data-automationid="moreActionsHeroField"]')
+            if more.count():
+                more.first.click(timeout=3000)
+            else:
+                node.click(button='right', timeout=3000)
+            # Fluent/Spartan context menu; languages seen in the supplied page.
+            menu = page.get_by_role('menu')
+            action = menu.get_by_role('menuitem', name=re.compile(
+                r'^\s*(Download|Baixar|Transferir|Descargar)(?:\s*\([^)]*\))?\s*$', re.I)).first
+            action.wait_for(state='visible', timeout=3000)
+            if not action.is_enabled() or action.get_attribute('aria-disabled') == 'true':
+                return 'disabled'
+            action.click(timeout=3000)
+            return 'clicked'
+        except Exception as exc:
+            return 'ui-' + type(exc).__name__
+        finally:
+            try:
+                page.keyboard.press('Escape')
+            except Exception:
+                pass
+
+    def read_page(self, context, page, url: str, *, target: dict | None = None,
+                  phase: str = 'list') -> tuple[str, str, Capture]:
         cap = Capture()
         pending: deque = deque()
         visited: set[str] = set()
-        started_requests: set = set()
+        inflight: set = set()
         started = time.monotonic()
-        deadline = min(self.deadline, time.monotonic() + self.limits.page_seconds)
+        deadline = min(self.deadline, started + self.limits.page_seconds)
+        stats = {'http': Counter(), 'network_failures': Counter(), 'json_objects': 0,
+                 'js_errors': 0, 'body_read_errors': 0, 'navigation': 'ok',
+                 'ui_download': 'not-needed', 'download_events': 0,
+                 'non_http_downloads': 0, 'scope_confirmed': False}
+        active: dict = {}
+        download_pages = []
 
         def consume(data, response_url, headers):
             before = set(cap.next_links)
             cap.scan(data)
+            stats['json_objects'] += 1
             for raw in cap.next_links - before:
                 nxt = urljoin(response_url, raw)
-                # Never send session authorization to a different origin.
                 if _microsoft_url(nxt) and urlsplit(nxt).netloc == urlsplit(response_url).netloc:
                     pending.append((nxt, headers))
                 else:
-                    self.warnings.add('Uma pagina de resultados nao foi seguida por mudar de origem.')
+                    self.warnings.add('Paginacao com mudanca de origem nao foi seguida.')
+
+        def consume_text(text, response_url, headers=None):
+            for value in json_values(text):
+                consume(value, response_url, headers or {})
 
         def on_request(request):
-            started_requests.add(request)
+            if request.resource_type in ('document', 'xhr', 'fetch', 'script'):
+                inflight.add(request)
+
+        def on_finished(request):
+            inflight.discard(request)
+
+        def on_failed(request):
+            inflight.discard(request)
+            stats['network_failures'][_network_code(request.failure)] += 1
 
         def on_response(response):
+            stats['http'][str(response.status)] += 1
             try:
-                if response.request not in started_requests:
-                    return
-                if response.status != 200 or not _microsoft_url(response.url):
+                if response.status not in (200, 206) or not _microsoft_url(response.url):
                     return
                 hdr = response.headers
                 ct = hdr.get('content-type', '').lower()
-                if 'json' not in ct and not (response.request.resource_type in ('xhr', 'fetch') and 'text/plain' in ct):
+                # A selected file may expose the signed URL only when Download is clicked.
+                if (active and is_direct_url(response.url) and
+                        ('attachment' in hdr.get('content-disposition', '').lower()) and
+                        not any(t in ct for t in ('html', 'json', 'multipart/'))):
+                    cap.add(active['name'], response.url, hdr.get('content-length'), active.get('id'))
                     return
-                if _size(hdr.get('content-length')) > 16 * 1024 * 1024:
-                    self.warnings.add('Resposta JSON muito grande; listagem pode estar incompleta.')
+                if re.match(r'^(audio|video|image|font)/', ct) or any(t in ct for t in ('zip', 'octet-stream', 'pdf')):
                     return
-                data = response.json()
-                visited.add(response.url)
+                if response.request.resource_type not in ('xhr', 'fetch') and 'json' not in ct:
+                    return
+                if _size(hdr.get('content-length')) > MAX_CAPTURE_BYTES:
+                    self.warnings.add('Uma resposta excedeu o limite de captura; listagem pode ser parcial.')
+                    return
+                # No requirement that request and response be seen in the same page/tab.
+                text = response.text()
+                headers = {}
                 try:
                     headers = {k: v for k, v in response.request.all_headers().items()
                                if k.lower() in ('authorization', 'accept', 'x-sharetoken', 'prefer')}
                 except Exception:
-                    headers = {}
-                consume(data, response.url, headers)
+                    pass
+                visited.add(response.url)
+                consume_text(text, response.url, headers)
             except Exception:
-                # Telemetry and unrelated responses need not be JSON.
-                return
+                stats['body_read_errors'] += 1
+
+        def on_download(download):
+            stats['download_events'] += 1
+            try:
+                if active and _microsoft_url(download.url):
+                    suggested = download.suggested_filename or ''
+                    if not suggested or suggested.casefold() == active['name'].casefold():
+                        cap.add(active['name'], download.url, 0, active.get('id'))
+                    else:
+                        self.warnings.add('Download com nome diferente do selecionado foi ignorado.')
+                elif active:
+                    stats['non_http_downloads'] += 1
+            finally:
+                # Discovery must not download an entire multi-GB archive.
+                try:
+                    download.cancel()
+                except Exception:
+                    pass
+
+        def attach_download(new_page):
+            new_page.on('download', on_download)
+            download_pages.append(new_page)
+
+        def on_page_error(_):
+            stats['js_errors'] += 1
+
+        def drain():
+            try:
+                packet = page.evaluate(DRAIN_JS)
+                if packet.get('dropped'):
+                    self.warnings.add('Fila de captura excedida; resultado pode ser parcial.')
+                for item in packet.get('items', []):
+                    if _microsoft_url(item.get('url', '')):
+                        consume_text(item.get('text', ''), item['url'])
+            except Exception:
+                pass
 
         context.on('request', on_request)
+        context.on('requestfinished', on_finished)
+        context.on('requestfailed', on_failed)
         context.on('response', on_response)
+        context.on('page', attach_download)
+        page.on('pageerror', on_page_error)
+        attach_download(page)
+        requested_path = _selected_path(url)
+        print('[onedrive:v2] ' + json.dumps({'phase': phase, 'event': 'start'}), flush=True)
         try:
             try:
-                page.goto(url, wait_until='domcontentloaded', timeout=45000)
-            except Exception:
-                # A timed-out navigation can still have loaded the folder.
+                remaining = max(100, min(45000, int((deadline - time.monotonic()) * 1000)))
+                page.goto(url, wait_until='domcontentloaded', timeout=remaining)
+            except Exception as exc:
+                stats['navigation'] = _network_code(exc)
                 if page.url == 'about:blank':
-                    raise OneDriveError('OneDrive: nao foi possivel abrir o compartilhamento no navegador.') from None
-            if _host(page.url) in ('login.live.com', 'login.microsoftonline.com'):
-                raise OneDriveError('OneDrive: este link exige login. Use um compartilhamento publico autorizado ou um downloadUrl valido.')
+                    raise OneDriveError('OneDrive: navegacao falhou antes de abrir a pagina. Veja [onedrive:v2] no log.') from None
             idle, pages = 0, 0
             previous = None
+            ui_attempted = False
+            script_scanned = False
             for _ in range(self.limits.max_scrolls):
                 if time.monotonic() >= deadline:
-                    self.warnings.add('Tempo limite da listagem atingido; resultado parcial.')
+                    self.warnings.add('Tempo limite da pagina atingido; listagem pode ser parcial.')
                     break
                 page.wait_for_timeout(self.limits.settle_ms)
-                cap.dom(page.evaluate(DOM_ROWS_JS))
-                # Browser-side fetch/XHR capture also sees cached/service-worker responses.
-                captured = page.evaluate(DRAIN_JS)
-                if captured.get('dropped'):
-                    self.warnings.add('Fila de respostas do navegador excedida; resultado parcial.')
-                for item in captured.get('items', []):
-                    if _microsoft_url(item.get('url', '')):
-                        consume(item.get('data'), item['url'], {})
-                for text in page.locator('script[type="application/json"]').all_text_contents():
-                    if len(text) <= 16 * 1024 * 1024:
-                        try:
-                            consume(json.loads(text), page.url, {})
-                        except ValueError:
-                            pass
+                if _host(page.url) in ('login.live.com', 'login.microsoftonline.com'):
+                    raise OneDriveError('OneDrive: o navegador foi redirecionado para login. Este runner nao possui uma sessao autenticada.')
+                rows = page.evaluate(DOM_ROWS_JS)
+                cap.dom(rows)
+                drain()
+                actual_path = page.evaluate(BREADCRUMB_PATH_JS) or _selected_path(page.url)
+                stats['scope_confirmed'] = not requested_path or actual_path.rstrip('/') == requested_path
+                if not script_scanned:
+                    inline_json = page.locator('script[type="application/json"]').all_text_contents()
+                    script_scanned = bool(inline_json)
+                    for text in inline_json:
+                        consume_text(text, page.url)
                 while pending and pages < self.limits.max_pages and time.monotonic() < deadline:
                     nxt, headers = pending.popleft()
                     if nxt in visited:
@@ -398,116 +633,158 @@ class BrowserResolver:
                     pages += 1
                     resp = None
                     try:
-                        resp = context.request.get(nxt, headers=headers, timeout=20000, max_redirects=0)
+                        resp = context.request.get(nxt, headers=headers,
+                            timeout=max(100, min(15000, int((deadline-time.monotonic())*1000))), max_redirects=0)
                         if resp.status != 200:
-                            self.warnings.add(f'Paginacao OneDrive recusada (HTTP {resp.status}); resultado parcial.')
+                            self.warnings.add(f'Paginacao recusada (HTTP {resp.status}); listagem parcial.')
                             continue
-                        if _size(resp.headers.get('content-length')) > 16 * 1024 * 1024:
-                            self.warnings.add('Pagina JSON muito grande; resultado parcial.')
-                            continue
-                        consume(resp.json(), nxt, headers)
+                        if _size(resp.headers.get('content-length')) <= MAX_CAPTURE_BYTES:
+                            consume_text(resp.text(), nxt, headers)
                     except Exception:
-                        self.warnings.add('Falha ao carregar uma pagina adicional; resultado parcial.')
+                        self.warnings.add('Falha em uma pagina adicional; listagem parcial.')
                     finally:
                         if resp is not None:
                             resp.dispose()
-                if pending:
-                    self.warnings.add('Limite de paginas atingido; resultado parcial.')
-                if len(cap.files) >= self.limits.max_files:
-                    self.warnings.add('Limite de arquivos atingido; resultado parcial.')
+                if target and stats['scope_confirmed']:
+                    if _match_file(cap.entries(), target):
+                        break
+                    row = next((r for r in rows if not r.get('folder') and r.get('name') == target.get('name')), None)
+                    if row and not ui_attempted:
+                        ui_attempted = True
+                        active.update(row)
+                        stats['ui_download'] = self._click_download(page, row)
+                        until = min(deadline, time.monotonic() + self.limits.download_seconds)
+                        while (stats['ui_download'] == 'clicked' and time.monotonic() < until
+                               and not _match_file(cap.entries(), target)):
+                            page.wait_for_timeout(250)
+                            drain()
+                        active.clear()
+                        if _match_file(cap.entries(), target):
+                            break
+                        if stats['ui_download'] == 'clicked':
+                            stats['ui_download'] = 'no-http-link'
+                        break
+                if len(cap.file_names) >= self.limits.max_files or len(cap.files) >= self.limits.max_files:
+                    self.warnings.add('Limite de arquivos atingido; listagem parcial.')
                     break
-                snapshot = (len(cap.files), len(cap.folders), len(cap.names), len(visited))
+                snapshot = (len(cap.files), len(cap.folders), len(cap.file_names), len(visited))
                 moved = page.evaluate(SCROLL_JS)
                 idle = idle + 1 if snapshot == previous and not moved and not pending else 0
                 previous = snapshot
-                has_listing = bool(cap.files or cap.folders or cap.names)
-                waited_for_empty = time.monotonic() - started >= min(15, self.limits.page_seconds / 2)
-                if idle >= 3 and (has_listing or waited_for_empty):
+                has_listing = bool(cap.file_names or cap.folders or cap.files)
+                # No 15-second "empty" shortcut. Without listing, wait page_seconds.
+                # Background telemetry must not keep a completed list alive forever.
+                if idle >= 3 and has_listing and stats['scope_confirmed']:
+                    break
+                state = _page_state(page, cap) if not has_listing and idle >= 3 else 'loading'
+                if state in ('access-denied', 'not-found', 'empty'):
                     break
             else:
-                self.warnings.add('Limite de rolagem atingido; resultado parcial.')
-            entries = cap.entries()
-            found = {e['name'] for e in entries}
-            missing = len(cap.file_names - found)
-            if missing:
-                self.warnings.add(f'{missing} arquivo(s) visiveis sem downloadUrl capturado.')
+                self.warnings.add('Limite de rolagem atingido; listagem parcial.')
+            if pending:
+                self.warnings.add('Limite de paginacao atingido; listagem parcial.')
+            if not stats['scope_confirmed'] and (cap.file_names or cap.folders or cap.files):
+                raise OneDriveError('OneDrive: a pagina aberta nao confirmou a subpasta solicitada. Nao vou enviar arquivos da pasta errada.')
             title = re.sub(r'\s*[-\u2013]\s*OneDrive\s*$', '', page.title()).strip()
             return page.url, title or 'OneDrive', cap
         finally:
             context.remove_listener('request', on_request)
+            context.remove_listener('requestfinished', on_finished)
+            context.remove_listener('requestfailed', on_failed)
             context.remove_listener('response', on_response)
+            context.remove_listener('page', attach_download)
+            page.remove_listener('pageerror', on_page_error)
+            for dp in download_pages:
+                try:
+                    dp.remove_listener('download', on_download)
+                except Exception:
+                    pass
+            self._report(phase, page, cap, stats, started)
 
-    def collect(self, context, page, url: str, recursive: bool = True) -> dict:
+    def collect(self, context, page, url: str, recursive: bool = True,
+                *, target: dict | None = None) -> dict:
         self.deadline = time.monotonic() + self.limits.total_seconds
         context.add_init_script(script=CAPTURE_JS)
         root = clean_url(url)
-        # The redeem link grants the public browser context access, but is NOT
-        # substituted for the requested deep URL: /Sessions must stay /Sessions.
         seed = sharing_url(root)
         if seed != root:
-            seed_page = context.new_page()
-            try:
-                seed_page.goto(seed, wait_until='domcontentloaded', timeout=45000)
-                seed_page.wait_for_timeout(self.limits.settle_ms)
-            except Exception:
-                pass
-            finally:
-                seed_page.close()
+            # Same tab and context. Let the shared page actually load before
+            # moving to /Sessions; do not close a still-authenticating seed tab.
+            self.read_page(context, page, seed, phase='bootstrap')
         tasks = deque([(root, '', 0)])
         seen: set[str] = set()
         entries, title = [], 'OneDrive'
         visited_folders = 0
+        last_cap = Capture()
         while tasks and visited_folders < self.limits.max_folders and len(entries) < self.limits.max_files:
             if time.monotonic() >= self.deadline:
                 self.warnings.add('Tempo total de listagem atingido; resultado parcial.')
                 break
-            target, rel, depth = tasks.popleft()
-            if target in seen:
+            dest, rel, depth = tasks.popleft()
+            key = _selected_path(dest) or dest
+            if key in seen:
                 continue
-            seen.add(target)
+            seen.add(key)
             visited_folders += 1
             try:
-                final_url, page_title, cap = self.read_page(context, page, target)
+                final, page_title, cap = self.read_page(context, page, dest,
+                    target=target, phase='resolve-file' if target else 'list')
             except OneDriveError:
                 if not entries and not rel:
                     raise
-                self.warnings.add('Uma subpasta nao pode ser aberta; resultado parcial.')
+                self.warnings.add('Uma subpasta nao pode ser aberta; listagem parcial.')
                 continue
-            seen.add(final_url)
+            last_cap = cap
             if not rel:
                 title = page_title
+            if target:
+                match = _match_file(cap.entries(), target)
+                if not match:
+                    last = self.diagnostics[-1] if self.diagnostics else {}
+                    state = last.get('state', 'unknown')
+                    ui = last.get('ui_download', 'not-attempted')
+                    raise OneDriveError(
+                        f'OneDrive: arquivo selecionado sem link de download. estado={state}; '
+                        f'arquivos={len(cap.file_names)}; acao={ui}. Veja [onedrive:v2] no log. '
+                        'Nenhuma pagina HTML foi enviada como arquivo.')
             now = time.time()
-            for e in cap.entries():
-                entries.append({**e, 'path': rel, 'presign': 'onedrive', 'od_page': final_url,
-                                'od_resolved_at': now})
-            if not recursive:
+            for entry in cap.listing(final):
+                entries.append({**entry, 'path': rel, 'presign': 'onedrive', 'od_page': final,
+                                'od_resolved_at': 0 if entry.get('od_pending') else now})
+            if target or not recursive:
                 break
             for folder in sorted(cap.folders.values(), key=lambda f: f['name'].casefold()):
                 if depth >= self.limits.max_depth:
                     self.warnings.add('Limite de profundidade atingido; subpastas omitidas.')
                     continue
-                child = folder_url(final_url, folder)
+                child = folder_url(final, folder)
                 if not child:
-                    self.warnings.add('Uma subpasta nao apresentou URL de navegacao; resultado parcial.')
+                    self.warnings.add('Subpasta sem URL de navegacao; resultado parcial.')
                     continue
-                if child not in seen:
+                child_key = _selected_path(child) or child
+                if child_key not in seen:
                     tasks.append((child, (rel + '/' if rel else '') + folder['name'], depth + 1))
         if tasks or len(entries) > self.limits.max_files:
             self.warnings.add('Limite de arquivos/pastas atingido; resultado parcial.')
         if not entries:
+            last = self.diagnostics[-1] if self.diagnostics else {}
+            state = last.get('state', 'unknown')
             raise OneDriveError(
-                'OneDrive: nenhum downloadUrl foi recebido. A pasta pode estar vazia, exigir login, '
-                'ter download bloqueado ou nao carregar no runner. '
-                'Abra o link em uma janela anonima; links diretos capturados pelo userscript tambem sao aceitos.'
-            )
-        # Stable identity/order across the picker and the second Actions run.
-        dedup = {(e['path'], e['od_uid']): e for e in entries}
-        result = sorted(dedup.values(), key=lambda e: (e['path'].casefold(), e['name'].casefold(), e['od_uid']))
+                f'OneDrive: nenhuma listagem de arquivos foi obtida. estado={state}; '
+                f'pastas={len(last_cap.folders)}; respostas_JSON={last.get("json_objects", 0)}; '
+                f'erros_JS={last.get("js_errors", 0)}. Veja [onedrive:v2] no log. '
+                'Isso, sozinho, nao confirma pasta vazia ou privada.')
+        dedup = {(e['path'], e['name']): e for e in entries}
+        result = sorted(dedup.values(), key=lambda e: (e['path'].casefold(), e['name'].casefold()))
+        pending_count = sum(bool(e.get('od_pending')) for e in result)
+        note = ('OneDrive (listagem; download sob demanda)' if pending_count
+                else 'OneDrive (downloadUrl via navegador)')
         return {'title': title, 'entries': result[:self.limits.max_files],
-                'warn': '; '.join(sorted(self.warnings)), 'note': 'OneDrive (downloadUrl via navegador)'}
+                'warn': '; '.join(sorted(self.warnings)), 'note': note}
 
 
-def expand_public(url: str, *, recursive: bool = True, limits: Limits | None = None) -> dict:
+def expand_public(url: str, *, recursive: bool = True, limits: Limits | None = None,
+                  target: dict | None = None) -> dict:
     url = clean_url(url)
     if not is_onedrive_url(url) or not _microsoft_url(url):
         raise OneDriveError('OneDrive: URL de compartilhamento invalida.')
@@ -517,31 +794,38 @@ def expand_public(url: str, *, recursive: bool = True, limits: Limits | None = N
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        raise OneDriveError('OneDrive: falta Playwright. Atualize tambem o workflow uploader.yml.') from None
+        raise OneDriveError('OneDrive: falta Playwright. Atualize o workflow uploader.yml.') from None
     with sync_playwright() as pw:
-        launch = {'headless': True}
+        # Real Chromium in its new headless mode, not chromium-headless-shell.
         executable = os.getenv('ONEDRIVE_CHROMIUM_EXECUTABLE')
+        launch = {'headless': True}
         if executable:
             launch['executable_path'] = executable
+        else:
+            launch['channel'] = 'chromium'
         try:
             browser = pw.chromium.launch(**launch)
         except Exception:
             executable = executable or shutil.which('chromium') or shutil.which('google-chrome')
             if not executable:
-                raise OneDriveError('OneDrive: Chromium ausente. Execute python -m playwright install --with-deps chromium.') from None
+                raise OneDriveError('OneDrive: instale o Chromium completo: python -m playwright install --with-deps chromium (sem --only-shell).') from None
             try:
                 browser = pw.chromium.launch(headless=True, executable_path=executable)
             except Exception:
-                raise OneDriveError('OneDrive: Chromium nao iniciou. Confira a etapa de instalacao no Actions.') from None
+                raise OneDriveError('OneDrive: Chromium nao iniciou. Confira a instalacao no Actions.') from None
+        context = None
         try:
-            context = browser.new_context(locale='en-US', accept_downloads=False, service_workers='allow')
+            context = browser.new_context(locale='en-US', accept_downloads=True,
+                service_workers='allow', viewport={'width': 1440, 'height': 1000})
             page = context.new_page()
-            return BrowserResolver(limits).collect(context, page, url, recursive)
+            return BrowserResolver(limits).collect(context, page, url, recursive, target=target)
         except OneDriveError:
             raise
-        except Exception:
-            raise OneDriveError('OneDrive: falha na leitura pelo navegador. Confira acesso publico e dependencias do Chromium.') from None
+        except Exception as exc:
+            raise OneDriveError('OneDrive: falha no navegador (' + type(exc).__name__ + '). Veja [onedrive:v2] no log.') from None
         finally:
+            if context is not None:
+                context.close()
             browser.close()
 
 
@@ -549,22 +833,26 @@ _REFRESH: dict[str, tuple[float, list[dict]]] = {}
 
 
 def fresh_url(entry: dict, *, force: bool = False) -> str:
-    """Refresh from the original folder, not from an expired signed URL."""
+    """A pending descriptor must NEVER return its HTML page to download_to()."""
     now = time.time()
-    if not force and now - float(entry.get('od_resolved_at') or 0) < 120:
+    if not entry.get('od_pending') and not force and now - float(entry.get('od_resolved_at') or 0) < 120:
         return entry['url']
     source = entry.get('od_page')
     if not source:
+        if entry.get('od_pending'):
+            raise OneDriveError('OneDrive: descritor pendente sem pagina de origem.')
         return entry['url']
     stamp, files = _REFRESH.get(source, (0, []))
-    if force or now - stamp >= 90:
-        files = expand_public(source, recursive=False)['entries']
+    match = _match_file(files, entry) if not force and now - stamp < 90 else None
+    if not match:
+        files = expand_public(source, recursive=False, target={
+            'name': entry.get('name'), 'od_uid': entry.get('od_uid'),
+            'od_item_id': entry.get('od_item_id')})['entries']
         stamp = time.time()
         _REFRESH[source] = (stamp, files)
-    match = next((f for f in files if f.get('od_uid') == entry.get('od_uid')), None)
-    if match is None:
-        match = next((f for f in files if f.get('name') == entry.get('name')), None)
-    if not match:
-        raise OneDriveError('OneDrive: o arquivo selecionado nao foi encontrado novamente na pasta.')
-    entry['url'], entry['od_resolved_at'] = match['url'], stamp
+        match = _match_file(files, entry)
+    if not match or match.get('od_pending') or not _microsoft_url(match.get('url', '')):
+        raise OneDriveError('OneDrive: o arquivo escolhido nao produziu um link de download HTTP autorizado.')
+    entry.update({'url': match['url'], 'od_resolved_at': stamp, 'od_pending': False,
+                  'od_uid': match.get('od_uid', entry.get('od_uid'))})
     return entry['url']
