@@ -1,0 +1,67 @@
+name: photocraft-tools
+on:
+  repository_dispatch:
+    types: [photocraft-tool]
+permissions:
+  contents: read
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Dependencies
+        run: python -m pip install 'pillow>=11,<13' 'requests>=2.32,<3' kurigram tgcrypto
+      - name: Validate authorization and mask file IDs
+        env:
+          PHOTOCRAFT_ALLOWED_USERS: ${{ vars.PHOTOCRAFT_ALLOWED_USERS }}
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          sys.path.insert(0, 'scripts')
+          from photocraft_job import allowed_payload
+          data = json.load(open(os.environ['GITHUB_EVENT_PATH']))['client_payload']
+          allowed_payload(data)
+          for item in (data.get('plan') or {}).get('assets', []):
+              print('::add-mask::' + item['file_id'])
+          print('PhotoCraft: payload autorizado; conteudo da receita omitido do log.')
+          PY
+      - name: Install pinned PhotoCraft
+        run: python scripts/install_photocraft.py --dir "$RUNNER_TEMP/photocraft"
+      - name: Native gate (never substitute mocks)
+        if: github.event.client_payload.op != 'test'
+        run: python scripts/photocraft_native_tests.py --out "$RUNNER_TEMP/photocraft-native-gate"
+      - name: Process PhotoCraft task
+        id: work
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          PHOTOCRAFT_ALLOWED_USERS: ${{ vars.PHOTOCRAFT_ALLOWED_USERS }}
+        run: python scripts/photocraft_job.py
+      - name: Report setup failure
+        if: failure() && steps.work.outcome != 'failure'
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          PHOTOCRAFT_ALLOWED_USERS: ${{ vars.PHOTOCRAFT_ALLOWED_USERS }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          p = json.load(open(os.environ['GITHUB_EVENT_PATH'])).get('client_payload', {})
+          allowed = [s.strip() for s in os.getenv('PHOTOCRAFT_ALLOWED_USERS','').split(',') if s.strip()]
+          token = os.getenv('BOT_TOKEN')
+          if token and str(p.get('user_id')) in allowed and type(p.get('chat_id')) is int:
+              data = {'chat_id':p['chat_id'], 'text':'PhotoCraft: instalacao ou teste nativo falhou antes da edicao. Veja o workflow photocraft-tools; nenhum resultado grafico foi confirmado.'}
+              if p.get('thread_id'): data['message_thread_id'] = p['thread_id']
+              req = urllib.request.Request('https://api.telegram.org/bot'+token+'/sendMessage', data=json.dumps(data).encode(), headers={'Content-Type':'application/json'})
+              try:
+                  urllib.request.urlopen(req, timeout=20).close()
+              except Exception:
+                  print('Falha ao enviar aviso Telegram; credenciais omitidas.')
+          PY
