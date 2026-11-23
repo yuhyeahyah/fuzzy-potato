@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PhotoCraft Telegram integration: single-file edition 0.2.
+"""PhotoCraft Telegram integration: single-file edition 0.2.1.
 
 Contains installer, bounded JSON-lines bridge, native tests, Telegram job and
 Worker patcher. Runtime: Python 3.12+, Pillow, requests, and optionally Kurigram/
@@ -20,7 +20,7 @@ The original PhotoCraft engine remains pinned to 0.23.1, without silent upgrade.
 from __future__ import annotations
 
 # Source merged from photocraft-bot-lab; see SOURCES.json for input hashes.
-INTEGRATION_VERSION = '0.2-single-file'
+INTEGRATION_VERSION = '0.2.1-single-file-auth'
 
 
 # ============================================================================
@@ -370,16 +370,187 @@ REPO="storytold/photocraft"
 MAX_ARCHIVE=900*1024*1024
 
 
+# Authentication is for release metadata on api.github.com only. Public release
+# downloads and redirects to a CDN must NEVER receive the workflow credential.
+import urllib.error
+from urllib.parse import urlsplit
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+MAX_METADATA = 8 * 1024 * 1024
+INSTALL_HTTP_ATTEMPTS = 3
+INSTALL_RETRY_BUDGET = 120  # seconds of explicit retry waits per request
+
+
+def _https_parts(url):
+    if not isinstance(url, str) or any(ord(c) < 32 or ord(c) == 127 for c in url):
+        raise PhotoError("URL de instalacao invalida.")
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        raise PhotoError("URL de instalacao invalida.") from None
+    if (parts.scheme != "https" or not parts.hostname or parts.username is not None
+            or parts.password is not None or port not in (None, 443)):
+        raise PhotoError("Instalacao exige HTTPS sem credenciais na URL e porta padrao.")
+    return parts
+
+
+def _api_url(url):
+    return _https_parts(url).hostname.lower() == "api.github.com"
+
+
+class _InstallRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = _https_parts(newurl)  # refuse an HTTPS -> HTTP downgrade
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            source = _https_parts(req.full_url)
+            same_api = source.hostname.lower() == target.hostname.lower() == "api.github.com"
+            if not same_api:
+                # Remove both regular and unredirected header forms.
+                for mapping in (redirected.headers, redirected.unredirected_hdrs):
+                    for key in list(mapping):
+                        if key.lower() in {"authorization", "proxy-authorization", "cookie"}:
+                            del mapping[key]
+        return redirected
+
+
+def _install_headers(url):
+    api = _api_url(url)
+    headers = {"User-Agent": "PhotoCraft-Telegram-Integration/" + INTEGRATION_VERSION,
+               "Accept": "application/vnd.github+json" if api else "*/*"}
+    if api:
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+        token = (os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or "").strip()
+        if token:
+            if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in token):
+                raise PhotoError("Token de instalacao contem caracteres invalidos.")
+            headers["Authorization"] = "Bearer " + token
+    return headers
+
+
+def _install_log(event, **fields):
+    # Callers provide only host names, booleans, counters and enum-like values.
+    # Neither URLs with query strings, response bodies nor credentials are logged.
+    print("[photocraft:install] " + json.dumps({"event": event, **fields}), flush=True)
+
+
+def _rate_limit_wait(headers, attempt, now=None):
+    now = time.time() if now is None else now
+    waits = []
+    retry = str(headers.get("Retry-After", "")).strip()
+    if retry:
+        try:
+            if retry.isdigit():
+                waits.append(int(retry))
+            else:
+                date = parsedate_to_datetime(retry)
+                if date.tzinfo is None:
+                    date = date.replace(tzinfo=timezone.utc)
+                waits.append(max(0, math.ceil(date.timestamp() - now)))
+        except (ValueError, TypeError, OverflowError):
+            pass
+    if str(headers.get("X-RateLimit-Remaining", "")) == "0":
+        reset = str(headers.get("X-RateLimit-Reset", ""))
+        if reset.isdigit():
+            # One extra second ensures the next call is after the reset time.
+            waits.append(max(1, math.ceil(int(reset) - now) + 1))
+    if not waits:
+        waits.append(60 * (2 ** attempt))
+    return max(1, max(waits))
+
+
+def _install_http_error(host, status, authenticated, limited, headers):
+    mode = "autenticada" if authenticated else "sem autenticacao"
+    if limited:
+        detail = f"GitHub: limite de requisicoes atingido em {host} (HTTP {status}; {mode})."
+        reset = str(headers.get("X-RateLimit-Reset", ""))
+        if reset.isdigit():
+            try:
+                stamp = datetime.fromtimestamp(int(reset), timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                detail += " Reset informado: " + stamp + "."
+            except (ValueError, OverflowError, OSError):
+                pass
+        if not authenticated and host == "api.github.com":
+            detail += " No passo do Python, configure GITHUB_TOKEN: ${{ github.token }} no workflow."
+        detail += " Nenhuma nova requisicao sera feita nesta tentativa; respeite o reset/Retry-After."
+        return PhotoError(detail)
+    if status == 401 and host == "api.github.com":
+        return PhotoError("GitHub: token recusado (HTTP 401). Use o token automatico do workflow; nao cole tokens no codigo.")
+    return PhotoError(f"Instalacao: HTTP {status} em {host} ({mode}); nao e uma falha grafica.")
+
+
 def get(url, dest=None):
-    req=urllib.request.Request(url,headers={"User-Agent":"PhotoCraft-Telegram-Integration/0.1","Accept":"application/vnd.github+json" if "api.github.com" in url else "*/*"})
-    with urllib.request.urlopen(req,timeout=90) as r:
-        if dest is None: return r.read(8*1024*1024)
-        size=0
-        with open(dest,"wb") as f:
-            while chunk:=r.read(1024*1024):
-                size+=len(chunk)
-                if size>MAX_ARCHIVE: raise RuntimeError("Download excedeu o limite.")
-                f.write(chunk)
+    headers = _install_headers(url)
+    host = _https_parts(url).hostname.lower()
+    authenticated = "Authorization" in headers
+    opener = urllib.request.build_opener(_InstallRedirect())
+    waited = 0
+    for attempt in range(INSTALL_HTTP_ATTEMPTS):
+        part = None
+        _install_log("request", host=host, authenticated=authenticated, attempt=attempt + 1)
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with opener.open(req, timeout=90) as response:
+                if dest is None:
+                    data = response.read(MAX_METADATA + 1)
+                    if len(data) > MAX_METADATA:
+                        raise PhotoError("Metadados da release excederam o limite.")
+                    return data
+                # An interrupted response must not replace a previous valid archive.
+                destination = Path(dest)
+                with tempfile.NamedTemporaryFile(mode="wb", prefix=destination.name + ".",
+                                                 suffix=".part", dir=destination.parent,
+                                                 delete=False) as stream:
+                    part = Path(stream.name)
+                    size = 0
+                    while chunk := response.read(1024 * 1024):
+                        size += len(chunk)
+                        if size > MAX_ARCHIVE:
+                            raise PhotoError("Download excedeu o limite.")
+                        stream.write(chunk)
+                declared = str(response.headers.get("Content-Length", ""))
+                if declared.isdigit() and size != int(declared):
+                    raise PhotoError("Download da release incompleto; arquivo temporario descartado.")
+                part.replace(destination)
+                part = None
+                return None
+        except urllib.error.HTTPError as exc:
+            # A redirect may fail on a CDN rather than on the API itself.
+            error_host = _https_parts(exc.geturl()).hostname.lower()
+            error_auth = authenticated and error_host == "api.github.com"
+            status = exc.code
+            error_headers = exc.headers or {}
+            try:
+                error_body = exc.read(4096).decode("utf-8", "replace").lower()
+            except Exception:
+                error_body = ""
+            finally:
+                exc.close()
+            limited = status == 429 or (status == 403 and (
+                str(error_headers.get("X-RateLimit-Remaining", "")) == "0"
+                or "rate limit" in error_body or "rate-limit" in error_body))
+            delay = None
+            if limited:
+                delay = _rate_limit_wait(error_headers, attempt)
+            elif status in (500, 502, 503, 504):
+                delay = 2 ** (attempt + 1)
+                # A server error may also carry Retry-After. Never retry earlier.
+                if error_headers.get("Retry-After"):
+                    delay = max(delay, _rate_limit_wait(error_headers, attempt))
+            if (delay is not None and attempt + 1 < INSTALL_HTTP_ATTEMPTS
+                    and delay <= INSTALL_RETRY_BUDGET - waited):
+                _install_log("retry", host=error_host, authenticated=error_auth,
+                             status=status, wait_seconds=delay, rate_limited=limited)
+                time.sleep(delay)
+                waited += delay
+                continue
+            raise _install_http_error(error_host, status, error_auth, limited, error_headers) from None
+        finally:
+            if part is not None:
+                part.unlink(missing_ok=True)
+    raise PhotoError("Instalacao: numero maximo de tentativas atingido.")
 
 
 def install(root:Path):
@@ -397,7 +568,10 @@ def install(root:Path):
     if not expected:
         checksum=next((a for a in release["assets"] if a["name"]=="SHA256SUMS.txt"),None)
         if not checksum: raise RuntimeError("Release sem checksum verificavel.")
-        for line in get(checksum["browser_download_url"]).decode().splitlines():
+        checksum_url = checksum["browser_download_url"]
+        if not checksum_url.startswith(f"https://github.com/{REPO}/releases/download/v{VERSION}/"):
+            raise RuntimeError("URL inesperada para o checksum.")
+        for line in get(checksum_url).decode().splitlines():
             m=re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?(.+)",line.strip())
             if m and m[2].removeprefix("./")==name: expected=m[1]; break
     if not expected: raise RuntimeError("SHA256 do tarball ausente; instalacao interrompida.")
@@ -1410,7 +1584,7 @@ def run_pipeline(args) -> int:
 
 def local_selftest(out: Path | None = None) -> bool:
     """Local adapter tests only. The native check never calls this as a fallback."""
-    classes = (PlanTests, ProcessTests, FileTests, UnifiedTests)
+    classes = (PlanTests, ProcessTests, FileTests, UnifiedTests, InstallerHTTPTests)
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(cls) for cls in classes)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     summary = {'suite': 'adapter-selftest', 'mocked_transport': True,
@@ -1702,6 +1876,327 @@ class UnifiedTests(unittest.TestCase):
                            capture_output=True, text=True, cwd=self.root, env=env)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn('payload autorizado', p.stdout)
+
+
+
+
+class InstallerHTTPTests(unittest.TestCase):
+    """HTTP responses are simulated. These tests do NOT execute PhotoCraft."""
+    API = 'https://api.github.com/repos/storytold/photocraft/releases/tags/v0.23.1'
+    ASSET = 'https://github.com/storytold/photocraft/releases/download/v0.23.1/photocraft-0.23.1-linux-x86_64.tar.gz'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.environment = patch.dict(os.environ, {'GITHUB_TOKEN': '', 'GH_TOKEN': ''})
+        self.environment.start()
+        self.sleeper = patch(__name__ + '.time.sleep')
+        self.sleep = self.sleeper.start()
+
+    def tearDown(self):
+        self.sleeper.stop()
+        self.environment.stop()
+        self.tmp.cleanup()
+
+    def response(self, data=b'{}', headers=None):
+        import io
+        from email.message import Message
+        obj = io.BytesIO(data)
+        obj.headers = Message()
+        for key, value in (headers or {}).items():
+            obj.headers[key] = str(value)
+        return obj
+
+    def error(self, status, body=b'', headers=None, url=None):
+        from email.message import Message
+        import io
+        msg = Message()
+        for key, value in (headers or {}).items():
+            msg[key] = str(value)
+        return urllib.error.HTTPError(url or self.API, status, 'test HTTP error', msg, io.BytesIO(body))
+
+    def redirect(self, target, source=None):
+        req = urllib.request.Request(source or self.API, headers={
+            'Authorization': 'Bearer fixture-redirect-secret',
+            'Cookie': 'fixture-cookie', 'Proxy-Authorization': 'fixture-proxy',
+            'User-Agent': 'fixture'})
+        return _InstallRedirect().redirect_request(req, None, 302, 'Found', {}, target)
+
+    def test_api_auth_from_github_token(self):
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-github-token'}):
+            headers = _install_headers(self.API)
+        self.assertEqual(headers['Authorization'], 'Bearer fixture-github-token')
+        self.assertEqual(headers['X-GitHub-Api-Version'], '2022-11-28')
+
+    def test_gh_token_fallback(self):
+        with patch.dict(os.environ, {'GH_TOKEN': 'fixture-local-token'}):
+            self.assertEqual(_install_headers(self.API)['Authorization'], 'Bearer fixture-local-token')
+
+    def test_github_token_precedence(self):
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-one', 'GH_TOKEN': 'fixture-two'}):
+            self.assertEqual(_install_headers(self.API)['Authorization'], 'Bearer fixture-one')
+
+    def test_absent_token_is_not_fake_authenticated(self):
+        self.assertNotIn('Authorization', _install_headers(self.API))
+
+    def test_token_whitespace_rejected(self):
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture\nsecret'}):
+            self.assertRaises(PhotoError, _install_headers, self.API)
+
+    def test_no_token_for_public_release(self):
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-secret'}):
+            self.assertNotIn('Authorization', _install_headers(self.ASSET))
+
+    def test_no_token_for_lookalike_domain(self):
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-secret'}):
+            self.assertNotIn('Authorization', _install_headers('https://api.github.com.example.invalid/path'))
+
+    def test_no_token_for_query_containing_api_host(self):
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-secret'}):
+            self.assertNotIn('Authorization', _install_headers('https://example.invalid/?next=api.github.com'))
+
+    def test_no_token_for_cdn(self):
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-secret'}):
+            self.assertNotIn('Authorization', _install_headers('https://release-assets.githubusercontent.com/a?sig=x'))
+
+    def test_invalid_urls_rejected(self):
+        for url in ('http://api.github.com/x', 'file:///x', 'https://api.github.com:8443/x',
+                    'https://user:password@api.github.com/x', 'https://api.github.com/x\n',
+                    'https://api.github.com:invalid/x', 'not-a-url'):
+            with self.subTest(url=url):
+                self.assertRaises(PhotoError, _install_headers, url)
+
+    def test_api_redirect_retains_auth_on_same_host(self):
+        request = self.redirect('https://api.github.com/repositories/1/releases')
+        self.assertEqual(request.get_header('Authorization'), 'Bearer fixture-redirect-secret')
+
+    def test_cross_host_redirect_removes_credentials(self):
+        for url in ('https://github.com/x', 'https://release-assets.githubusercontent.com/x',
+                    'https://api.github.com.example.invalid/x'):
+            with self.subTest(url=url):
+                request = self.redirect(url)
+                for key in ('Authorization', 'Cookie', 'Proxy-authorization'):
+                    self.assertIsNone(request.get_header(key))
+                self.assertEqual(request.get_header('User-agent'), 'fixture')
+
+    def test_redirect_downgrade_refused(self):
+        self.assertRaises(PhotoError, self.redirect, 'http://api.github.com/x')
+
+    def test_redirect_userinfo_refused(self):
+        self.assertRaises(PhotoError, self.redirect, 'https://user:password@api.github.com/x')
+
+    def test_redirect_to_api_does_not_add_auth(self):
+        req = urllib.request.Request(self.ASSET, headers={'User-Agent': 'fixture'})
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-secret'}):
+            result = _InstallRedirect().redirect_request(req, None, 302, 'Found', {}, self.API)
+        self.assertIsNone(result.get_header('Authorization'))
+
+    def test_request_sends_auth_header(self):
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-secret'}):
+            with patch(__name__ + '.urllib.request.build_opener') as build:
+                build.return_value.open.return_value = self.response(b'{"ok":true}')
+                self.assertEqual(get(self.API), b'{"ok":true}')
+                req = build.return_value.open.call_args.args[0]
+                self.assertEqual(req.get_header('Authorization'), 'Bearer fixture-secret')
+        self.sleep.assert_not_called()
+
+    def test_request_logs_never_show_token(self):
+        import io
+        from contextlib import redirect_stdout
+        output = io.StringIO()
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-secret-do-not-print'}):
+            with patch(__name__ + '.urllib.request.build_opener') as build, redirect_stdout(output):
+                build.return_value.open.return_value = self.response()
+                get(self.API)
+        self.assertNotIn('fixture-secret-do-not-print', output.getvalue())
+        self.assertIn('"authenticated": true', output.getvalue())
+
+    def test_metadata_size_limit(self):
+        with patch(__name__ + '.MAX_METADATA', 4), patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.return_value = self.response(b'12345')
+            self.assertRaisesRegex(PhotoError, 'Metadados', get, self.API)
+
+    def test_complete_download_replaces_atomically(self):
+        destination = self.root / 'engine.tar.gz'
+        destination.write_bytes(b'old')
+        with patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.return_value = self.response(b'new-content', {'Content-Length': '11'})
+            get(self.ASSET, destination)
+        self.assertEqual(destination.read_bytes(), b'new-content')
+        self.assertEqual(list(self.root.glob('*.part')), [])
+
+    def test_short_download_preserves_old_archive(self):
+        destination = self.root / 'engine.tar.gz'
+        destination.write_bytes(b'old')
+        with patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.return_value = self.response(b'short', {'Content-Length': '20'})
+            self.assertRaisesRegex(PhotoError, 'incompleto', get, self.ASSET, destination)
+        self.assertEqual(destination.read_bytes(), b'old')
+        self.assertEqual(list(self.root.glob('*.part')), [])
+
+    def test_oversize_download_cleans_temp(self):
+        destination = self.root / 'engine.tar.gz'
+        with patch(__name__ + '.MAX_ARCHIVE', 4), patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.return_value = self.response(b'12345')
+            self.assertRaisesRegex(PhotoError, 'limite', get, self.ASSET, destination)
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(self.root.glob('*.part')), [])
+
+    def test_retry_after_seconds(self):
+        self.assertEqual(_rate_limit_wait({'Retry-After': '17'}, 0, now=1000), 17)
+
+    def test_retry_after_http_date(self):
+        from email.utils import formatdate
+        value = formatdate(1021, usegmt=True)
+        self.assertEqual(_rate_limit_wait({'Retry-After': value}, 0, now=1000), 21)
+
+    def test_primary_reset_respected(self):
+        self.assertEqual(_rate_limit_wait({'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1030'}, 0, now=1000), 31)
+
+    def test_stricter_wait_is_used(self):
+        self.assertEqual(_rate_limit_wait({'Retry-After': '10', 'X-RateLimit-Remaining': '0',
+                                          'X-RateLimit-Reset': '1030'}, 0, now=1000), 31)
+
+    def test_secondary_wait_has_backoff(self):
+        self.assertEqual(_rate_limit_wait({}, 0, now=1000), 60)
+        self.assertEqual(_rate_limit_wait({}, 1, now=1000), 120)
+
+    def test_invalid_retry_after_uses_safe_delay(self):
+        self.assertEqual(_rate_limit_wait({'Retry-After': 'bogus'}, 0, now=1000), 60)
+
+    def test_retry_after_zero_not_busy_loop(self):
+        self.assertEqual(_rate_limit_wait({'Retry-After': '0'}, 0, now=1000), 1)
+
+    def test_429_retry_succeeds(self):
+        with patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = [self.error(429, headers={'Retry-After': 2}), self.response(b'ok')]
+            self.assertEqual(get(self.API), b'ok')
+            self.assertEqual(build.return_value.open.call_count, 2)
+        self.sleep.assert_called_once_with(2)
+
+    def test_primary_403_waits_until_reset(self):
+        error = self.error(403, headers={'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1010'})
+        with patch(__name__ + '.time.time', return_value=1000), patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = [error, self.response(b'ok')]
+            self.assertEqual(get(self.API), b'ok')
+        self.sleep.assert_called_once_with(11)
+
+    def test_secondary_403_waits_at_least_minute(self):
+        with patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = [self.error(403, b'secondary rate limit'), self.response(b'ok')]
+            self.assertEqual(get(self.API), b'ok')
+        self.sleep.assert_called_once_with(60)
+
+    def test_long_rate_limit_stops_without_early_retry(self):
+        error = self.error(403, headers={'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '5000'})
+        with patch(__name__ + '.time.time', return_value=1000), patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = error
+            with self.assertRaisesRegex(PhotoError, 'Reset informado') as caught:
+                get(self.API)
+            self.assertEqual(build.return_value.open.call_count, 1)
+            self.assertIn('GITHUB_TOKEN: ${{ github.token }}', str(caught.exception))
+        self.sleep.assert_not_called()
+
+    def test_auth_failure_does_not_retry_anonymously(self):
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-secret'}), patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = self.error(401, b'fixture-secret')
+            with self.assertRaisesRegex(PhotoError, 'token recusado') as caught:
+                get(self.API)
+            self.assertEqual(build.return_value.open.call_count, 1)
+            self.assertNotIn('fixture-secret', str(caught.exception))
+        self.sleep.assert_not_called()
+
+    def test_403_permission_failure_not_classified_rate_limit(self):
+        with patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = self.error(403, b'Resource not accessible')
+            with self.assertRaisesRegex(PhotoError, 'HTTP 403') as caught:
+                get(self.API)
+            self.assertNotIn('limite de requisicoes', str(caught.exception))
+            self.assertEqual(build.return_value.open.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_404_not_retried(self):
+        with patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = self.error(404)
+            self.assertRaisesRegex(PhotoError, 'HTTP 404', get, self.API)
+            self.assertEqual(build.return_value.open.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_transient_503_retried(self):
+        with patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = [self.error(503), self.response(b'ok')]
+            self.assertEqual(get(self.API), b'ok')
+        self.sleep.assert_called_once_with(2)
+
+    def test_503_retry_after_respected(self):
+        with patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = [self.error(503, headers={'Retry-After': '19'}), self.response(b'ok')]
+            self.assertEqual(get(self.API), b'ok')
+        self.sleep.assert_called_once_with(19)
+
+    def test_retries_bounded(self):
+        with patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = [self.error(429, headers={'Retry-After': '1'}) for _ in range(3)]
+            self.assertRaisesRegex(PhotoError, 'limite de requisicoes', get, self.API)
+            self.assertEqual(build.return_value.open.call_count, 3)
+        self.assertEqual(self.sleep.call_count, 2)
+
+    def test_retry_wait_budget_bounded(self):
+        with patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = [self.error(429, headers={'Retry-After': '70'}) for _ in range(3)]
+            self.assertRaises(PhotoError, get, self.API)
+            self.assertEqual(build.return_value.open.call_count, 2)
+        self.sleep.assert_called_once_with(70)
+
+    def test_cdn_failure_not_reported_authenticated(self):
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-secret'}), patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = self.error(403, url='https://release-assets.githubusercontent.com/a?sig=fixture-private-query')
+            with self.assertRaises(PhotoError) as caught:
+                get(self.API)
+            self.assertIn('sem autenticacao', str(caught.exception))
+            self.assertNotIn('fixture-private-query', str(caught.exception))
+
+    def test_auth_rate_error_omits_credentials_and_body(self):
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-secret'}), patch(__name__ + '.urllib.request.build_opener') as build:
+            build.return_value.open.side_effect = self.error(403, b'rate limit fixture-secret', {'Retry-After': '500'})
+            with self.assertRaises(PhotoError) as caught:
+                get(self.API)
+            self.assertIn('autenticada', str(caught.exception))
+            self.assertNotIn('fixture-secret', str(caught.exception))
+
+    def test_digest_mismatch_remains_fatal(self):
+        def fake_get(link, dest=None):
+            if dest is None:
+                return json.dumps({'tag_name': 'v' + VERSION, 'assets': [{
+                    'name': f'photocraft-{VERSION}-linux-x86_64.tar.gz',
+                    'browser_download_url': self.ASSET, 'digest': 'sha256:' + '0' * 64}]}).encode()
+            Path(dest).write_bytes(b'not-the-verified-release')
+        with patch(__name__ + '.get', side_effect=fake_get), patch(__name__ + '.subprocess.run') as process:
+            self.assertRaisesRegex(RuntimeError, 'SHA256 divergente', install, self.root/'install')
+            process.assert_not_called()
+
+    def test_missing_checksum_remains_fatal(self):
+        data = {'tag_name': 'v' + VERSION, 'assets': [{
+            'name': f'photocraft-{VERSION}-linux-x86_64.tar.gz', 'browser_download_url': self.ASSET}]}
+        with patch(__name__ + '.get', return_value=json.dumps(data).encode()), patch(__name__ + '.subprocess.run') as process:
+            self.assertRaisesRegex(RuntimeError, 'checksum verificavel', install, self.root/'install')
+            process.assert_not_called()
+
+    def test_unexpected_checksum_host_is_refused(self):
+        data = {'tag_name': 'v' + VERSION, 'assets': [{
+            'name': f'photocraft-{VERSION}-linux-x86_64.tar.gz', 'browser_download_url': self.ASSET},
+            {'name': 'SHA256SUMS.txt', 'browser_download_url': 'https://example.invalid/SHA256SUMS.txt'}]}
+        with patch(__name__ + '.get', return_value=json.dumps(data).encode()) as getter:
+            self.assertRaisesRegex(RuntimeError, 'URL inesperada para o checksum', install, self.root/'install')
+            self.assertEqual(getter.call_count, 1)
+
+    def test_github_token_redacted_in_execution_report(self):
+        report = ExecutionReport(self.root/'report', 'fixture')
+        with patch.dict(os.environ, {'GITHUB_TOKEN': 'fixture-private-token'}):
+            def fail():
+                raise RuntimeError('fixture-private-token must be removed')
+            self.assertRaises(RuntimeError, report.step, 'install', fail)
+        self.assertNotIn('fixture-private-token', report.path.read_text())
 
 
 if __name__ == '__main__':
