@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PhotoCraft Telegram integration: single-file edition 0.2.1.
+"""PhotoCraft Telegram integration: single-file edition 0.2.2.
 
 Contains installer, bounded JSON-lines bridge, native tests, Telegram job and
 Worker patcher. Runtime: Python 3.12+, Pillow, requests, and optionally Kurigram/
@@ -20,7 +20,7 @@ The original PhotoCraft engine remains pinned to 0.23.1, without silent upgrade.
 from __future__ import annotations
 
 # Source merged from photocraft-bot-lab; see SOURCES.json for input hashes.
-INTEGRATION_VERSION = '0.2.1-single-file-auth'
+INTEGRATION_VERSION = '0.2.2-single-file-cli-discovery'
 
 
 # ============================================================================
@@ -553,53 +553,178 @@ def get(url, dest=None):
     raise PhotoError("Instalacao: numero maximo de tentativas atingido.")
 
 
-def install(root:Path):
-    root=root.resolve(); root.mkdir(parents=True,exist_ok=True)
-    release=json.loads(get(f"https://api.github.com/repos/{REPO}/releases/tags/v{VERSION}"))
-    if release.get("tag_name")!=f"v{VERSION}": raise RuntimeError("Tag inesperada.")
-    name=f"photocraft-{VERSION}-linux-x86_64.tar.gz"
-    asset=next((a for a in release.get("assets",[]) if a["name"]==name),None)
-    if not asset: raise RuntimeError("Release sem o tarball esperado: "+name)
-    url=asset["browser_download_url"]
-    if not url.startswith(f"https://github.com/{REPO}/releases/download/v{VERSION}/"):
+# The Linux packages also contain a bash completion named photocraft-cli.
+# A basename match is NOT proof that a file is the native command-line program.
+import stat
+
+
+def _inspect_cli_candidate(path: Path, unpacked: Path) -> dict:
+    """Inspect a file header without executing it or following symlinks."""
+    record = {"path": path.relative_to(unpacked).as_posix(),
+              "eligible": False, "reason": "unreadable"}
+    try:
+        relative = path.relative_to(unpacked)
+        current = unpacked
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                record["reason"] = "symlink"
+                return record
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            record["reason"] = "not_regular"
+            return record
+        record.update(size=info.st_size, mode=oct(stat.S_IMODE(info.st_mode)))
+        # ELF64 header: EI_CLASS=2, EI_DATA=1, EM_X86_64=62.
+        # This is only a format/architecture check; SHA-256 establishes which
+        # release was fetched, and --version/native tests must still pass.
+        with path.open("rb") as stream:
+            header = stream.read(64)
+        if not header.startswith(b"\x7fELF"):
+            record["reason"] = "not_elf"
+        elif len(header) < 64:
+            record["reason"] = "truncated_elf_header"
+        elif header[4:7] != b"\x02\x01\x01":
+            record["reason"] = "not_elf64_little_endian"
+        elif int.from_bytes(header[18:20], "little") != 62:
+            record["reason"] = "not_x86_64"
+        elif int.from_bytes(header[16:18], "little") not in (2, 3):
+            record["reason"] = "not_executable_or_pie"
+        elif (int.from_bytes(header[20:24], "little") != 1
+              or int.from_bytes(header[52:54], "little") != 64):
+            record["reason"] = "invalid_elf_header"
+        else:
+            record.update(eligible=True, reason="elf64_x86_64")
+    except OSError as exc:
+        record.update(reason="unreadable", error_type=type(exc).__name__)
+    return record
+
+
+def _discover_cli(unpacked: Path, report_path: Path) -> tuple[Path, dict]:
+    """Choose one native binary, ignoring completions/docs with the same name."""
+    unpacked = Path(unpacked)
+    if unpacked.is_symlink() or not unpacked.is_dir():
+        raise PhotoError("Diretorio de extracao invalido para procurar o CLI.")
+    unpacked = unpacked.resolve(strict=True)
+    matches = sorted(unpacked.rglob("photocraft-cli"))
+    entries = [_inspect_cli_candidate(path, unpacked) for path in matches]
+    binaries = [path for path, row in zip(matches, entries) if row["eligible"]]
+    report = {
+        "integration": INTEGRATION_VERSION,
+        "status": "selected" if len(binaries) == 1 else "missing" if not binaries else "ambiguous",
+        "name_matches": len(matches), "native_candidates": len(binaries),
+        "candidates": entries[:40], "inventory_truncated": len(entries) > 40,
+        "native_rendering_confirmed": False,
+    }
+    if len(binaries) == 1:
+        report["selected"] = binaries[0].relative_to(unpacked).as_posix()
+    report_path.write_text(json.dumps(report, ensure_ascii=True, indent=2), encoding="utf-8")
+    _install_log("binary-discovery", **report)
+    if not binaries:
+        raise PhotoError(
+            f"Nenhum photocraft-cli ELF64 x86_64 valido entre {len(matches)} nomes encontrados. "
+            "Veja binary-discovery e install-discovery.json; nenhum arquivo auxiliar foi executado.")
+    if len(binaries) != 1:
+        raise PhotoError(
+            f"Mais de um photocraft-cli ELF64 x86_64 valido ({len(binaries)}). "
+            "Veja install-discovery.json; nenhum candidato foi escolhido arbitrariamente.")
+    return binaries[0], report
+
+
+def install(root: Path):
+    root = root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    # Do not publish stale diagnostics from an earlier installation attempt.
+    for report_name in ("install-report.json", "install-discovery.json"):
+        (root / report_name).unlink(missing_ok=True)
+    release = json.loads(get(f"https://api.github.com/repos/{REPO}/releases/tags/v{VERSION}"))
+    if release.get("tag_name") != f"v{VERSION}":
+        raise RuntimeError("Tag inesperada.")
+    name = f"photocraft-{VERSION}-linux-x86_64.tar.gz"
+    asset = next((a for a in release.get("assets", []) if a["name"] == name), None)
+    if not asset:
+        raise RuntimeError("Release sem o tarball esperado: " + name)
+    url = asset["browser_download_url"]
+    prefix = f"https://github.com/{REPO}/releases/download/v{VERSION}/"
+    if not url.startswith(prefix):
         raise RuntimeError("URL inesperada para o artefato.")
-    digest=asset.get("digest") or ""
-    expected=digest[7:] if re.fullmatch(r"sha256:[0-9a-fA-F]{64}",digest) else None
+    digest = asset.get("digest") or ""
+    expected = digest[7:] if re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest) else None
     if not expected:
-        checksum=next((a for a in release["assets"] if a["name"]=="SHA256SUMS.txt"),None)
-        if not checksum: raise RuntimeError("Release sem checksum verificavel.")
+        checksum = next((a for a in release["assets"] if a["name"] == "SHA256SUMS.txt"), None)
+        if not checksum:
+            raise RuntimeError("Release sem checksum verificavel.")
         checksum_url = checksum["browser_download_url"]
-        if not checksum_url.startswith(f"https://github.com/{REPO}/releases/download/v{VERSION}/"):
+        if not checksum_url.startswith(prefix):
             raise RuntimeError("URL inesperada para o checksum.")
         for line in get(checksum_url).decode().splitlines():
-            m=re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?(.+)",line.strip())
-            if m and m[2].removeprefix("./")==name: expected=m[1]; break
-    if not expected: raise RuntimeError("SHA256 do tarball ausente; instalacao interrompida.")
-    archive=root/name
-    if not archive.exists() or archive_sha256(archive).lower()!=expected.lower(): get(url,archive)
-    actual=archive_sha256(archive)
-    if actual.lower()!=expected.lower(): raise RuntimeError("SHA256 divergente.")
-    with tarfile.open(archive,"r:gz") as tf:
-        members=tf.getmembers()
-        if sum(m.size for m in members)>3*1024**3 or len(members)>10000: raise RuntimeError("Arquivo compactado grande demais.")
-        tf.extractall(root/"unpacked",filter="data")
-    candidates=[p for p in (root/"unpacked").rglob("photocraft-cli") if p.is_file() and not p.is_symlink()]
-    if len(candidates)!=1: raise RuntimeError("Nao encontrei exatamente um photocraft-cli.")
-    exe=candidates[0]; exe.chmod(exe.stat().st_mode|0o100)
-    probe_env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "LD_LIBRARY_PATH", "FONTCONFIG_PATH") if k in os.environ}
-    probe_home = root / "probe-home"
-    probe_home.mkdir(exist_ok=True)
-    probe_env.update(HOME=str(probe_home), XDG_CONFIG_HOME=str(probe_home / "config"), XDG_CACHE_HOME=str(probe_home / "cache"), PHOTOCRAFT_GPU="0")
-    p=subprocess.run([str(exe),"--version"],capture_output=True,text=True,timeout=30,check=True,env=probe_env)
-    if VERSION not in p.stdout+p.stderr: raise RuntimeError("Versao do executavel diverge da release.")
-    result={"version":VERSION,"asset":name,"archive_sha256":actual,"binary":str(exe),"reported_version":(p.stdout+p.stderr).strip()}
-    (root/"install-report.json").write_text(json.dumps(result,indent=2))
+            match = re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?(.+)", line.strip())
+            if match and match[2].removeprefix("./") == name:
+                expected = match[1]
+                break
+    if not expected:
+        raise RuntimeError("SHA256 do tarball ausente; instalacao interrompida.")
+    archive = root / name
+    if not archive.exists() or archive_sha256(archive).lower() != expected.lower():
+        get(url, archive)
+    actual = archive_sha256(archive)
+    if actual.lower() != expected.lower():
+        raise RuntimeError("SHA256 divergente.")
+    _install_log("archive-verified", asset=name, sha256=actual)
+
+    # Search only the extraction made by THIS attempt, never stale directories.
+    unpacked = Path(tempfile.mkdtemp(prefix="unpacked-", dir=root))
+    try:
+        with tarfile.open(archive, "r:gz") as tf:
+            members = tf.getmembers()
+            if sum(m.size for m in members) > 3 * 1024**3 or len(members) > 10000:
+                raise RuntimeError("Arquivo compactado grande demais.")
+            tf.extractall(unpacked, filter="data")
+        exe, discovery = _discover_cli(unpacked, root / "install-discovery.json")
+        # Do not make the bash completion or other data files executable.
+        exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+        probe_env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "LD_LIBRARY_PATH", "FONTCONFIG_PATH") if k in os.environ}
+        probe_home = root / "probe-home"
+        probe_home.mkdir(exist_ok=True)
+        probe_env.update(HOME=str(probe_home), XDG_CONFIG_HOME=str(probe_home / "config"),
+                         XDG_CACHE_HOME=str(probe_home / "cache"), PHOTOCRAFT_GPU="0")
+        probe = subprocess.run([str(exe), "--version"], capture_output=True, text=True,
+                               timeout=30, check=True, env=probe_env)
+        reported = (probe.stdout + probe.stderr).strip()
+        if not re.search(r"(?<![0-9.])" + re.escape(VERSION) + r"(?![0-9.])", reported):
+            raise RuntimeError("Versao do executavel diverge da release.")
+        result = {"version": VERSION, "asset": name, "archive_sha256": actual,
+                  "binary": str(exe), "binary_member": discovery["selected"],
+                  "binary_sha256": archive_sha256(exe), "reported_version": reported,
+                  "name_matches": discovery["name_matches"],
+                  "native_candidates": discovery["native_candidates"]}
+        (root / "install-report.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    except BaseException:
+        shutil.rmtree(unpacked, ignore_errors=True)
+        raise
     os.environ["PHOTOCRAFT_BIN"] = str(exe)
     if os.getenv("GITHUB_ENV"):
-        with open(os.environ["GITHUB_ENV"],"a") as f: f.write("PHOTOCRAFT_BIN="+str(exe)+"\n")
-    print(json.dumps(result,indent=2))
+        with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as stream:
+            stream.write("PHOTOCRAFT_BIN=" + str(exe) + "\n")
+    print(json.dumps(result, indent=2))
     return result
 
+
+def _install_with_diagnostics(root: Path, report_root: Path):
+    """Include discovery evidence in the existing Actions artifact, even on failure."""
+    try:
+        return install(root)
+    finally:
+        for name in ("install-report.json", "install-discovery.json"):
+            source = Path(root).resolve() / name
+            destination = Path(report_root).resolve() / name
+            try:
+                if source.is_file() and not source.is_symlink() and source != destination:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, destination)
+            except OSError as exc:
+                # Diagnostic copying must not hide the original install error.
+                _install_log("diagnostics-copy-failed", file=name, error_type=type(exc).__name__)
 
 # ============================================================================
 # Incorporated from photocraft_native_tests.py
@@ -1554,7 +1679,7 @@ def run_pipeline(args) -> int:
     try:
         payload = report.step('authorize', _validated_event, args.event)
         report.payload = payload
-        report.step('install', install, args.dir)
+        report.step('install', _install_with_diagnostics, args.dir, report.root)
         native_result = report.step('native-test', _run_native_gate, report.root / 'native')
         report.data['native_rendering_confirmed'] = True
         report.save()
@@ -1584,7 +1709,7 @@ def run_pipeline(args) -> int:
 
 def local_selftest(out: Path | None = None) -> bool:
     """Local adapter tests only. The native check never calls this as a fallback."""
-    classes = (PlanTests, ProcessTests, FileTests, UnifiedTests, InstallerHTTPTests)
+    classes = (PlanTests, ProcessTests, FileTests, UnifiedTests, InstallerHTTPTests, InstallerDiscoveryTests)
     suite = unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(cls) for cls in classes)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     summary = {'suite': 'adapter-selftest', 'mocked_transport': True,
@@ -1605,7 +1730,7 @@ def check_pipeline(args) -> int:
             if not local_selftest(report.root):
                 raise PhotoError('Teste do adaptador falhou. Isso nao e um teste grafico.')
         report.step('selftest', test_adapter)
-        report.step('install', install, args.dir)
+        report.step('install', _install_with_diagnostics, args.dir, report.root)
         report.step('native-test', _run_native_gate, report.root / 'native')
         report.data['native_rendering_confirmed'] = True
         report.finish()
@@ -1782,10 +1907,10 @@ class UnifiedTests(unittest.TestCase):
 
     def test_install_same_process_env_and_secret_isolation(self):
         import io
-        content = b'fixture-not-a-real-engine'
+        content = _test_elf_header()  # synthetic header; process probe is mocked
         archive = self.root / 'source.tar.gz'
         with tarfile.open(archive, 'w:gz') as tf:
-            item = tarfile.TarInfo('package/photocraft-cli'); item.size = len(content)
+            item = tarfile.TarInfo('package/bin/photocraft-cli'); item.size = len(content)
             tf.addfile(item, io.BytesIO(content))
         digest = archive_sha256(archive)
         url = f'https://github.com/{REPO}/releases/download/v{VERSION}/fixture.tar.gz'
@@ -2197,6 +2322,312 @@ class InstallerHTTPTests(unittest.TestCase):
                 raise RuntimeError('fixture-private-token must be removed')
             self.assertRaises(RuntimeError, report.step, 'install', fail)
         self.assertNotIn('fixture-private-token', report.path.read_text())
+
+def _test_elf_header(*, machine=62, elf_type=3, elf_class=2, endian=1,
+                     version=1, header_size=64) -> bytes:
+    """Synthetic ELF header for parser tests. NOT a working PhotoCraft binary."""
+    import struct
+    data = bytearray(64)
+    data[:7] = bytes([0x7f, 0x45, 0x4c, 0x46, elf_class, endian, 1])
+    struct.pack_into('<HHI', data, 16, elf_type, machine, version)
+    struct.pack_into('<H', data, 52, header_size)
+    return bytes(data)
+
+
+class InstallerDiscoveryTests(unittest.TestCase):
+    """Local tar/header/selection tests. Network and native probe are mocked."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.tree = self.root / 'tree'
+        self.tree.mkdir()
+        self.report = self.root / 'discovery.json'
+        self.environment = patch.dict(os.environ, {'GITHUB_ENV': '', 'PHOTOCRAFT_BIN': ''})
+        self.environment.start()
+
+    def tearDown(self):
+        self.environment.stop()
+        self.tmp.cleanup()
+
+    def put(self, name='package/bin/photocraft-cli', content=None, mode=0o644):
+        path = self.tree / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(_test_elf_header() if content is None else content)
+        path.chmod(mode)
+        return path
+
+    def select(self):
+        return _discover_cli(self.tree, self.report)
+
+    def archive(self, files=None):
+        import io
+        files = files if files is not None else {
+            'package/bin/photocraft-cli': _test_elf_header(),
+            'package/share/bash-completion/completions/photocraft-cli': b'# bash completion fixture\n',
+            'package/share/doc/README.txt': b'synthetic archive, not PhotoCraft\n',
+        }
+        archive = self.root / 'source.tar.gz'
+        with tarfile.open(archive, 'w:gz') as tf:
+            for name, data in files.items():
+                member = tarfile.TarInfo(name)
+                member.mode = 0o644
+                member.size = len(data)
+                tf.addfile(member, io.BytesIO(data))
+        digest = archive_sha256(archive)
+        asset = f'photocraft-{VERSION}-linux-x86_64.tar.gz'
+        url = f'https://github.com/{REPO}/releases/download/v{VERSION}/{asset}'
+        metadata = {'tag_name': 'v' + VERSION, 'assets': [
+            {'name': asset, 'browser_download_url': url, 'digest': 'sha256:' + digest}]}
+        def fetch(link, dest=None):
+            if dest is None:
+                return json.dumps(metadata).encode()
+            shutil.copyfile(archive, dest)
+        return fetch
+
+    def installer(self, files=None, version=None):
+        """Context manager: fixture tar bytes + a simulated --version response."""
+        from contextlib import ExitStack
+        stack = ExitStack()
+        getter = stack.enter_context(patch(__name__ + '.get', side_effect=self.archive(files)))
+        process = stack.enter_context(patch(__name__ + '.subprocess.run', return_value=
+            subprocess.CompletedProcess(['fixture'], 0, 'photocraft-cli ' + (version or VERSION) + ' (fixture)\n', '')))
+        return stack, getter, process
+
+    def test_reproduces_basename_collision_and_selects_binary(self):
+        binary = self.put()
+        self.put('package/share/bash-completion/completions/photocraft-cli', b'# bash completion\n')
+        old_candidates = [p for p in self.tree.rglob('photocraft-cli') if p.is_file() and not p.is_symlink()]
+        self.assertEqual(len(old_candidates), 2)  # the old installer rejects this
+        selected, report = self.select()
+        self.assertEqual(selected, binary)
+        self.assertEqual(report['name_matches'], 2)
+        self.assertEqual(report['native_candidates'], 1)
+        self.assertEqual(report['candidates'][1]['reason'], 'not_elf')
+        self.assertFalse(report['native_rendering_confirmed'])
+
+    def test_executable_completion_still_not_native(self):
+        binary = self.put()
+        self.put('share/bash-completion/completions/photocraft-cli', b'#!/bin/sh\nexit 0\n', 0o755)
+        self.assertEqual(self.select()[0], binary)
+
+    def test_missing_execute_bit_does_not_confuse_header_selection(self):
+        binary = self.put(mode=0o644)
+        self.assertEqual(self.select()[0], binary)
+        self.assertFalse(binary.stat().st_mode & stat.S_IXUSR)
+
+    def test_usr_bin_layout(self):
+        binary = self.put('release/usr/bin/photocraft-cli')
+        self.assertEqual(self.select()[0], binary)
+
+    def test_bare_binary_layout(self):
+        binary = self.put('photocraft-cli')
+        self.assertEqual(self.select()[0], binary)
+
+    def test_completion_only_is_not_executed(self):
+        self.put('share/bash-completion/completions/photocraft-cli', b'# shell source')
+        with patch(__name__ + '.subprocess.run') as process:
+            self.assertRaisesRegex(PhotoError, 'Nenhum photocraft-cli ELF64', self.select)
+            process.assert_not_called()
+        report = json.loads(self.report.read_text())
+        self.assertEqual((report['status'], report['name_matches']), ('missing', 1))
+
+    def test_missing_name_gets_precise_inventory(self):
+        self.assertRaisesRegex(PhotoError, '0 nomes encontrados', self.select)
+        self.assertEqual(json.loads(self.report.read_text())['native_candidates'], 0)
+
+    def test_two_native_binaries_are_not_chosen_arbitrarily(self):
+        self.put('one/bin/photocraft-cli')
+        self.put('two/bin/photocraft-cli')
+        self.assertRaisesRegex(PhotoError, 'Mais de um', self.select)
+        report = json.loads(self.report.read_text())
+        self.assertEqual(report['native_candidates'], 2)
+        self.assertEqual(report['status'], 'ambiguous')
+        self.assertNotIn('selected', report)
+
+    def test_candidate_symlink_is_rejected(self):
+        target = self.put('real-binary')
+        (self.tree / 'photocraft-cli').symlink_to(target)
+        self.assertRaises(PhotoError, self.select)
+        self.assertEqual(json.loads(self.report.read_text())['candidates'][0]['reason'], 'symlink')
+
+    def test_parent_symlink_is_rejected(self):
+        self.put('real/bin/photocraft-cli')
+        (self.tree / 'alias').symlink_to(self.tree / 'real', target_is_directory=True)
+        row = _inspect_cli_candidate(self.tree / 'alias/bin/photocraft-cli', self.tree)
+        self.assertEqual(row['reason'], 'symlink')
+
+    def test_root_symlink_is_rejected(self):
+        link = self.root / 'tree-link'
+        link.symlink_to(self.tree, target_is_directory=True)
+        self.assertRaisesRegex(PhotoError, 'Diretorio de extracao', _discover_cli, link, self.report)
+
+    def test_missing_root_is_rejected(self):
+        self.assertRaises(PhotoError, _discover_cli, self.root / 'absent', self.report)
+
+    def test_unrelated_native_filename_is_not_a_cli(self):
+        self.put('package/bin/photocraft')
+        self.assertRaises(PhotoError, self.select)
+        self.assertEqual(json.loads(self.report.read_text())['name_matches'], 0)
+
+    def test_directory_named_cli_is_not_regular_file(self):
+        (self.tree / 'photocraft-cli').mkdir()
+        self.assertRaises(PhotoError, self.select)
+        self.assertEqual(json.loads(self.report.read_text())['candidates'][0]['reason'], 'not_regular')
+
+    def test_truncated_elf_rejected(self):
+        binary = self.put(content=b'\x7fELF')
+        self.assertEqual(_inspect_cli_candidate(binary, self.tree)['reason'], 'truncated_elf_header')
+
+    def test_shell_script_rejected_even_with_expected_version_text(self):
+        self.put(content=b'#!/bin/sh\necho photocraft-cli 0.23.1\n', mode=0o755)
+        self.assertRaises(PhotoError, self.select)
+
+    def test_32bit_elf_rejected(self):
+        binary = self.put(content=_test_elf_header(elf_class=1))
+        self.assertEqual(_inspect_cli_candidate(binary, self.tree)['reason'], 'not_elf64_little_endian')
+
+    def test_big_endian_elf_rejected(self):
+        binary = self.put(content=_test_elf_header(endian=2))
+        self.assertEqual(_inspect_cli_candidate(binary, self.tree)['reason'], 'not_elf64_little_endian')
+
+    def test_arm64_elf_rejected(self):
+        binary = self.put(content=_test_elf_header(machine=183))
+        self.assertEqual(_inspect_cli_candidate(binary, self.tree)['reason'], 'not_x86_64')
+
+    def test_object_file_rejected(self):
+        binary = self.put(content=_test_elf_header(elf_type=1))
+        self.assertEqual(_inspect_cli_candidate(binary, self.tree)['reason'], 'not_executable_or_pie')
+
+    def test_invalid_elf_version_rejected(self):
+        binary = self.put(content=_test_elf_header(version=0))
+        self.assertEqual(_inspect_cli_candidate(binary, self.tree)['reason'], 'invalid_elf_header')
+
+    def test_invalid_elf_header_size_rejected(self):
+        binary = self.put(content=_test_elf_header(header_size=52))
+        self.assertEqual(_inspect_cli_candidate(binary, self.tree)['reason'], 'invalid_elf_header')
+
+    def test_pie_and_exec_accepted_for_subsequent_version_probe(self):
+        for value in (2, 3):
+            with self.subTest(elf_type=value):
+                binary = self.put(content=_test_elf_header(elf_type=value))
+                self.assertTrue(_inspect_cli_candidate(binary, self.tree)['eligible'])
+
+    def test_read_error_recorded_without_execution(self):
+        binary = self.put()
+        with patch.object(Path, 'open', side_effect=PermissionError('fixture')):
+            row = _inspect_cli_candidate(binary, self.tree)
+        self.assertEqual(row['reason'], 'unreadable')
+        self.assertEqual(row['error_type'], 'PermissionError')
+
+    def test_inventory_output_is_bounded(self):
+        for number in range(50):
+            self.put(f'completion-{number:02d}/photocraft-cli', b'# text')
+        self.assertRaises(PhotoError, self.select)
+        report = json.loads(self.report.read_text())
+        self.assertEqual(report['name_matches'], 50)
+        self.assertEqual(len(report['candidates']), 40)
+        self.assertTrue(report['inventory_truncated'])
+
+    def test_install_extracts_fixture_and_only_probes_binary(self):
+        stack, getter, process = self.installer()
+        with stack:
+            result = install(self.root / 'install')
+        binary = Path(result['binary'])
+        self.assertEqual(binary.parts[-2:], ('bin', 'photocraft-cli'))
+        self.assertEqual(result['name_matches'], 2)
+        self.assertEqual(result['native_candidates'], 1)
+        process.assert_called_once()
+        self.assertEqual(process.call_args.args[0], [str(binary), '--version'])
+        self.assertTrue(binary.stat().st_mode & stat.S_IXUSR)
+        completion = binary.parent.parent / 'share/bash-completion/completions/photocraft-cli'
+        self.assertFalse(completion.stat().st_mode & stat.S_IXUSR)
+        self.assertEqual(result['binary_sha256'], archive_sha256(binary))
+
+    def test_stale_directory_not_searched(self):
+        destination = self.root / 'install'
+        stale = destination / 'unpacked/old/photocraft-cli'
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(_test_elf_header())
+        stack, _, _ = self.installer()
+        with stack:
+            result = install(destination)
+        self.assertNotEqual(result['binary'], str(stale))
+        self.assertEqual(result['native_candidates'], 1)
+        self.assertTrue(stale.exists())
+
+    def test_repeated_install_is_not_ambiguous(self):
+        stack, getter, process = self.installer()
+        with stack:
+            first = install(self.root / 'install')
+            second = install(self.root / 'install')
+        self.assertNotEqual(first['binary'], second['binary'])
+        self.assertEqual(second['native_candidates'], 1)
+        self.assertEqual(process.call_count, 2)
+        self.assertEqual(getter.call_count, 3)  # metadata twice; archive once
+
+    def test_missing_cli_retains_diagnostics_and_cleans_extraction(self):
+        stack, _, process = self.installer({'share/photocraft-cli': b'# only completion'})
+        with stack:
+            self.assertRaises(PhotoError, install, self.root / 'install')
+        process.assert_not_called()
+        self.assertTrue((self.root / 'install/install-discovery.json').is_file())
+        self.assertFalse(list((self.root / 'install').glob('unpacked-*')))
+        self.assertEqual(os.environ['PHOTOCRAFT_BIN'], '')
+
+    def test_bad_version_remains_fatal(self):
+        stack, _, _ = self.installer(version='0.22.0')
+        with stack:
+            self.assertRaisesRegex(RuntimeError, 'Versao do executavel', install, self.root / 'install')
+        self.assertFalse(list((self.root / 'install').glob('unpacked-*')))
+        self.assertFalse((self.root / 'install/install-report.json').exists())
+
+    def test_version_prefix_is_not_accepted_as_exact_version(self):
+        stack, _, _ = self.installer(version='0.23.10')
+        with stack:
+            self.assertRaisesRegex(RuntimeError, 'Versao do executavel', install, self.root / 'install')
+
+    def test_version_probe_failure_is_not_hidden(self):
+        stack, _, process = self.installer()
+        process.side_effect = subprocess.CalledProcessError(127, ['fixture'], stderr='missing library')
+        with stack:
+            self.assertRaises(subprocess.CalledProcessError, install, self.root / 'install')
+        self.assertFalse(list((self.root / 'install').glob('unpacked-*')))
+
+    def test_archive_traversal_rejected_before_probe(self):
+        stack, _, process = self.installer({'../../escape.bin': b'no'})
+        with stack:
+            self.assertRaises(tarfile.TarError, install, self.root / 'install')
+        process.assert_not_called()
+        self.assertFalse((self.root / 'escape.bin').exists())
+
+    def test_failure_artifact_contains_discovery(self):
+        stack, _, _ = self.installer({'share/photocraft-cli': b'# only completion'})
+        with stack:
+            self.assertRaises(PhotoError, _install_with_diagnostics, self.root / 'install', self.root / 'diagnostics')
+        self.assertEqual(json.loads((self.root / 'diagnostics/install-discovery.json').read_text())['status'], 'missing')
+
+    def test_success_artifact_contains_both_installation_reports(self):
+        stack, _, _ = self.installer()
+        with stack:
+            _install_with_diagnostics(self.root / 'install', self.root / 'diagnostics')
+        for name in ('install-report.json', 'install-discovery.json'):
+            self.assertEqual((self.root / 'install' / name).read_bytes(), (self.root / 'diagnostics' / name).read_bytes())
+
+    def test_diagnostics_copy_cannot_mask_original_error(self):
+        root = self.root / 'install'; root.mkdir()
+        (root / 'install-discovery.json').write_text('{}')
+        with patch(__name__ + '.install', side_effect=PhotoError('original failure')):
+            with patch(__name__ + '.shutil.copyfile', side_effect=PermissionError('fixture')):
+                self.assertRaisesRegex(PhotoError, 'original failure', _install_with_diagnostics, root, self.root / 'out')
+
+    def test_stale_reports_cleared_before_new_network_attempt(self):
+        root = self.root / 'install'; root.mkdir()
+        for name in ('install-report.json', 'install-discovery.json'):
+            (root / name).write_text('{"stale":true}')
+        with patch(__name__ + '.get', side_effect=PhotoError('fixture network failure')):
+            self.assertRaises(PhotoError, install, root)
+        for name in ('install-report.json', 'install-discovery.json'):
+            self.assertFalse((root / name).exists())
 
 
 if __name__ == '__main__':
