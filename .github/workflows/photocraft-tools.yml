@@ -1,0 +1,67 @@
+# One Python file supplies every PhotoCraft task.
+# Keep this YAML at .github/workflows/photocraft-tools.yml.
+name: photocraft-tools
+on:
+  repository_dispatch:
+    types: [photocraft-tool]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  render:
+    if: github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Dependencies
+        run: python -m pip install 'pillow>=11,<13' 'requests>=2.32,<3' kurigram tgcrypto
+      - name: Authorize, install, native test and process
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          PHOTOCRAFT_ALLOWED_USERS: ${{ vars.PHOTOCRAFT_ALLOWED_USERS }}
+        run: >-
+          python scripts/photocraft.py run
+          --dir "$RUNNER_TEMP/photocraft"
+          --out "$RUNNER_TEMP/photocraft-report"
+      - name: Diagnostics (synthetic test data; no source photos)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: photocraft-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/photocraft-report
+          if-no-files-found: warn
+          retention-days: 7
+  verify:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Test dependencies (no Telegram credentials)
+        run: python -m pip install 'pillow>=11,<13' 'requests>=2.32,<3'
+      - name: Adapter selftest, installation and real native tests
+        run: >-
+          python scripts/photocraft.py check
+          --dir "$RUNNER_TEMP/photocraft"
+          --out "$RUNNER_TEMP/photocraft-report"
+      - name: Test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: photocraft-check-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/photocraft-report
+          if-no-files-found: warn
+          retention-days: 7
